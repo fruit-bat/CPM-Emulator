@@ -27,6 +27,8 @@
 
 #include <fstream>
 #include <exception>
+#include <algorithm>
+#include <vector>
 
 int main(int argc, char** argv) {
    setvbuf(stdin, NULL, _IONBF, 0); //turn off buffering
@@ -40,13 +42,13 @@ int main(int argc, char** argv) {
 #endif
 
 	try {
-		if (argc > 2) {
-			std::cerr << "Invalid number of arguments!" << std::endl;
-			return EXIT_FAILURE;
-		}
-		const char* prog = argc > 1 ? argv[1] : "CCP-DR.64K";
-		const unsigned addr = argc > 1 ? 0x0100 : 0xF400;
-		Computer<64, 0xFC00, 0xFE00> computer(prog, addr);
+	// cpm                  : boot CP/M (CCP-DR.64K)
+	// cpm prog.com [args]  : run a program, leave at its end
+		const std::string prog = argc > 1 ? argv[1] : "CCP-DR.64K";
+		const uint16_t addr = argc > 1 ? 0x0100 : 0xF400;
+		const std::vector<std::string> args(argv + std::min(argc, 2), argv + argc);
+		Computer<64, 0xFC00, 0xFE00> computer(prog, addr, args);
+		conctrl_init();
 		computer.start();
 	}
 	catch (std::exception& e) {

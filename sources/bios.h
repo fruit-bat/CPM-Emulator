@@ -71,34 +71,54 @@ public:
 	}
 
 /**
- * BDOS functions.
+ * BIOS functions.
  * PC register contains the local address.
+ * BOOT & WBOOT are handled by the Computer (warm boot).
  */	
-	void function(Z80& cpu, uint8_t *const memory) {
+	void function(Z80& cpu, [[maybe_unused]] uint8_t *const memory) {
 		assert(memory);
 		switch (Z80_PC(cpu)) {
-			case BOOT_ADDR: {
-				std::cerr << " : Unimplemented BIOS function BOOT!" << std::endl;
-				
-				throw std::runtime_error("Un-emulated BIOS function");
-				break;
-			}
-			case WBOOT_ADDR: {
-				std::cerr << " : Unimplemented BIOS function WBOOT!" << std::endl;
-				
-				throw std::runtime_error("Un-emulated BIOS function");
-				break;
-			}
 			case CONST_ADDR: {
-				Z80_A(cpu) = conctrl_kbhit() ? 0xff : 0x00;
+				Z80_A(cpu) = conctrl_status();
 				break;
 			}
 			case CONIN_ADDR : {
-				Z80_A(cpu) = conctrl_getch();
+				Z80_A(cpu) = conctrl_getch_wait();
 				break;
 			}
 			case CONOUT_ADDR : {
 				console_putc(Z80_C(cpu));
+				break;
+			}
+			case LIST_ADDR :		// No printer: discard
+			case PUNCH_ADDR : {		// No punch: discard
+				break;
+			}
+			case READER_ADDR : {	// No reader: always end of file
+				Z80_A(cpu) = 0x1A;
+				break;
+			}
+			case HOME_ADDR :
+			case SETTRK_ADDR :
+			case SETSEC_ADDR :
+			case SETDMA_ADDR : {	// Disks are emulated by the BDOS
+				break;
+			}
+			case SELDSK_ADDR : {	// No physical disk: HL=0 means error
+				Z80_HL(cpu) = 0x0000;
+				break;
+			}
+			case READ_ADDR :
+			case WRITE_ADDR : {		// No physical disk: A=1 means error
+				Z80_A(cpu) = 0x01;
+				break;
+			}
+			case LISTST_ADDR : {	// Printer always ready
+				Z80_A(cpu) = 0xFF;
+				break;
+			}
+			case SECTRAN_ADDR : {	// No skew
+				Z80_HL(cpu) = Z80_BC(cpu);
 				break;
 			}
 				
@@ -111,15 +131,23 @@ public:
 		}
 	}
 
-protected:
-
-private:
 	enum {
 		BOOT_ADDR 	= BIOS_ADDR + 3 * 0,
 		WBOOT_ADDR 	= BIOS_ADDR + 3 * 1,
 		CONST_ADDR 	= BIOS_ADDR + 3 * 2,
 		CONIN_ADDR 	= BIOS_ADDR + 3 * 3,
 		CONOUT_ADDR = BIOS_ADDR + 3 * 4,
-//		LIST_ADDR 	= BIOS_ADDR + 3 * 5
+		LIST_ADDR 	= BIOS_ADDR + 3 * 5,
+		PUNCH_ADDR 	= BIOS_ADDR + 3 * 6,
+		READER_ADDR = BIOS_ADDR + 3 * 7,
+		HOME_ADDR 	= BIOS_ADDR + 3 * 8,
+		SELDSK_ADDR = BIOS_ADDR + 3 * 9,
+		SETTRK_ADDR = BIOS_ADDR + 3 * 10,
+		SETSEC_ADDR = BIOS_ADDR + 3 * 11,
+		SETDMA_ADDR = BIOS_ADDR + 3 * 12,
+		READ_ADDR 	= BIOS_ADDR + 3 * 13,
+		WRITE_ADDR 	= BIOS_ADDR + 3 * 14,
+		LISTST_ADDR = BIOS_ADDR + 3 * 15,
+		SECTRAN_ADDR = BIOS_ADDR + 3 * 16
 	};
 };
