@@ -21,4 +21,6 @@ add_subdirectory(external/Z80)
 add_executable(cpm "${CMAKE_CURRENT_SOURCE_DIR}/sources/main.cpp")
 target_compile_features(cpm PRIVATE cxx_std_17)
 target_link_libraries(cpm PRIVATE Z80)
+# The host console & files: the terminal & the current directory
+target_include_directories(cpm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/sources/host/std")
 install(TARGETS cpm RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")

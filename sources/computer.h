@@ -22,7 +22,6 @@
 #include <iostream>
 #include <iomanip>
 #include <string>
-#include <fstream>
 #include <exception>
 #include <vector>
 
@@ -192,29 +191,24 @@ public:
  */ 
 	void load(const std::string& aFile, const uint16_t aAddr=0x0100) {
 		assert(!aFile.empty());
-		
-		auto fs = std::ifstream(aFile, std::ios_base::binary | std::ios_base::in);
-		if (fs) {
-//			std::clog << "Loading " << aFile << "... ";
-			unsigned addr = aAddr;
-			while (fs.good()) {
-				const uint8_t c = fs.get();
-				if (!fs.eof()) {
-					if (addr >= MEMORY_SIZE * 1024U) {
-						constexpr char WRITING_OUT_OF_MEMORY[] = "Writing out of memory";
-						std::cerr << ">> " << WRITING_OUT_OF_MEMORY << ": "
-								  << std::hex << addr << std::endl;
-						throw std::runtime_error(WRITING_OUT_OF_MEMORY);
-					}
-					memory[addr++] = c;
-				}
-			}
-			fs.close();
-//			std::clog << ">> " << addr - aAddr << " bytes read." << std::endl;
-		} else {
+
+		hostfs::File file;
+		uint32_t size;
+		if (!file.open(aFile, false) || !file.size(size)) {
 			constexpr char ERROR_OPENING_FILE[] = "Error opening file";
 			std::cerr << ">> " << ERROR_OPENING_FILE << '"' << aFile << '"' << std::endl;
 			throw std::runtime_error(ERROR_OPENING_FILE);
+		}
+		if (aAddr + size > MEMORY_SIZE * 1024U) {
+			constexpr char WRITING_OUT_OF_MEMORY[] = "Writing out of memory";
+			std::cerr << ">> " << WRITING_OUT_OF_MEMORY << ": "
+					  << std::hex << MEMORY_SIZE * 1024U << std::endl;
+			throw std::runtime_error(WRITING_OUT_OF_MEMORY);
+		}
+		if (file.read(0, memory + aAddr, size) != size) {
+			constexpr char ERROR_READING_FILE[] = "Error reading file";
+			std::cerr << ">> " << ERROR_READING_FILE << '"' << aFile << '"' << std::endl;
+			throw std::runtime_error(ERROR_READING_FILE);
 		}
 	}
 	

@@ -17,171 +17,80 @@
 #pragma once
 
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <csignal>
-#include <iostream>
-#include <termios.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <sys/ioctl.h>
+#include <cstdio>
 
-inline void conctrl_save_cursor_pos();
-inline void conctrl_restore_cursor_pos();
-inline void conctrl_mono_mode();
-inline void conctrl_mono80_mode();
-inline void conctrl_home();
-inline void conctrl_cls();
-inline void conctrl_clear_to_end_of_line();
-inline void conctrl_clear_to_end_of_screen();
-inline void conctrl_black_text_on_white();
-inline void conctrl_white_text_on_black();
-inline void conctrl_move_cursor(const uint8_t x, const uint8_t y);
-inline int conctrl_kbhit();
-inline int conctrl_getch();
-inline int conctrl_getch_wait();
+/**
+ * The host console (host_console.h, from the host directory of the build) provides:
+ *   conctrl_init()        get the console ready, once at start
+ *   conctrl_putc(c)       write a character
+ *   conctrl_status()      0FFh if a key is waiting, 0 otherwise
+ *   conctrl_kbhit()       non zero if a key is waiting (conctrl_status() may hide piped input)
+ *   conctrl_getch()       a key if one is waiting, 0 otherwise
+ *   conctrl_getch_wait()  wait for a key
+ * This file turns the Kaypro / ADM-3A codes of CP/M programs into ANSI ones.
+ */
+#include "host_console.h"
 
 #define ESC ((char)0x1b)
 
-// Escape key for emulator commands (like telnet): Ctrl-] q leaves the emulator,
-// Ctrl-] Ctrl-] sends a Ctrl-]
-#define CONCTRL_CMD 0x1d
-
-// Terminal settings saved by conctrl_init(), restored on exit
-inline struct termios conctrl_saved_termios;
-inline bool conctrl_raw = false;
-
-inline void conctrl_restore() {
-    if (conctrl_raw) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &conctrl_saved_termios);
-        conctrl_raw = false;
-    }
+inline void conctrl_puts(const char *s) {
+    while (*s) conctrl_putc(*s++);
 }
 
-inline void conctrl_signal(int sig) {
-    conctrl_restore();
-    std::signal(sig, SIG_DFL);
-    std::raise(sig);
-}
-
-/**
- * Put the terminal in non-canonical mode without echo, so that keys are seen
- * as soon as they are typed (CP/M programs do their own echo).
- * Signal keys are turned off: ^C, ^Z... belong to CP/M.
- * Nothing is done when stdin is not a terminal (e.g. piped input).
- */
-inline void conctrl_init() {
-    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &conctrl_saved_termios)) return;
-    struct termios raw = conctrl_saved_termios;
-    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
-    raw.c_iflag &= ~(ICRNL | IXON);   // RETURN gives CR, ^S/^Q reach the program
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw)) return;
-    conctrl_raw = true;
-    std::atexit(conctrl_restore);
-    std::signal(SIGINT, conctrl_signal);
-    std::signal(SIGTERM, conctrl_signal);
-    std::cout << "[CP/M emulator: Ctrl-] q to quit]" << std::endl;
-}
-
-inline int conctrl_kbhit(void) {
-	int characters_buffered = 0;
-	ioctl(STDIN_FILENO, FIONREAD, &characters_buffered);
-	return characters_buffered;
-}
-
-inline bool conctrl_tty() {
-    static const bool tty = isatty(STDIN_FILENO);
-    return tty;
-}
-
-/**
- * Console status (BDOS 11 / BIOS CONST). Programs poll it to stop on a key
- * press, which would eat piped input: then it never reports a key.
- */
-inline int conctrl_status(void) {
-    return conctrl_tty() && conctrl_kbhit() ? 0xFF : 0x00;
-}
-
-inline void conctrl_quit() {
-    std::cout << ESC << "[0m" << ESC << "[?25h" << std::endl;
-    std::exit(EXIT_SUCCESS);
-}
-
-/**
- * Wait for a key. Leaves the emulator when the input is exhausted,
- * or on Ctrl-] q at a terminal.
- */
-inline int conctrl_getch_wait(void) {
-    std::cout.flush();
-    int c = getchar();
-    if (c == CONCTRL_CMD && conctrl_tty()) {
-        c = getchar();
-        if (c == 'q' || c == 'Q') conctrl_quit();
-    }
-    switch(c) {
-        case EOF: std::cout << std::endl; std::exit(EXIT_SUCCESS);
-        case 10: return 13;
-        default: return c;
-    }
-}
-
-/**
- * Return a key if one is waiting, 0 otherwise.
- * Piped input is all typed ahead: wait for it, so that its end is seen.
- */
-inline int conctrl_getch(void) {
-	if (conctrl_tty() && !conctrl_kbhit()) return 0;
-    return conctrl_getch_wait();
+// ESC then s
+inline void conctrl_esc(const char *s) {
+    conctrl_putc(ESC);
+    conctrl_puts(s);
 }
 
 inline void conctrl_save_cursor_pos() {
-    std::cout << ESC << "[s";
+    conctrl_esc("[s");
 }
 
 inline void conctrl_restore_cursor_pos() {
-    std::cout << ESC << "[u";
+    conctrl_esc("[u");
 }
 
 inline void conctrl_mono_mode() {
     // ESC[=0h	40 x 25 monochrome (text)
-    std::cout << ESC << "[=0h";
+    conctrl_esc("[=0h");
 }
 
 inline void conctrl_mono80_mode() {
     // ESC[=2h	80 x 25 monochrome (text)
-    std::cout << ESC << "[=2h";
+    conctrl_esc("[=2h");
 }
 
 inline void conctrl_home() {
-    std::cout << ESC << "[H";
+    conctrl_esc("[H");
 }
 
 inline void conctrl_cls(){
-    std::cout << ESC << "[2J" << ESC << "[H";
+    conctrl_esc("[2J"); conctrl_esc("[H");
 }
 
 inline void conctrl_black_text_on_white() {
-    std::cout << ESC << "[0m";
-    std::cout << ESC << "[7m";
+    conctrl_esc("[0m");
+    conctrl_esc("[7m");
 }
 
 inline void conctrl_white_text_on_black() {
-    std::cout << ESC << "[0m";
+    conctrl_esc("[0m");
 }
 
 // row & col from 0, ANSI counts from 1
 inline void conctrl_move_cursor(const uint8_t row, const uint8_t col) {
-    std::cout << ESC << "[" << (unsigned)row + 1 << ';' <<  (unsigned)col + 1 << 'H';
+    char s[12];
+    snprintf(s, sizeof(s), "[%u;%uH", unsigned(row) + 1, unsigned(col) + 1);
+    conctrl_esc(s);
 }
 
 inline void conctrl_clear_to_end_of_line() {
-    std::cout << ESC << "[0K";
+    conctrl_esc("[0K");
 }
 
 inline void conctrl_clear_to_end_of_screen() {
-    std::cout << ESC << "[0J";
+    conctrl_esc("[0J");
 }
 
 // See https://www.seasip.info/Cpm/cpm86esc.html	
@@ -222,7 +131,7 @@ inline unsigned console_el() {
 // Unknown sequence: pass it through untouched
 inline void console_output_buf() {
     for(unsigned i = 0; i < coni; ++i) {
-        std::cout << (char)conb[i];
+        conctrl_putc(conb[i]);
     }
 }
 
@@ -234,24 +143,24 @@ inline void console_exeb() {
 // ESC 1
 // enable the status line.
     case 'A': { // ESC A - cursor up, unless at the top
-        std::cout << ESC << "[A";
+        conctrl_esc("[A");
         break;
     }
     case 'B':   // ESC B n - Kaypro: set attribute n
     case 'C': { // ESC C n - Kaypro: clear attribute n
         const bool set = conb[1] == 'B';
         switch(conb[2]) {
-            case '0': std::cout << ESC << (set ? "[7m" : "[27m"); break;     // reverse video
-            case '1': std::cout << ESC << (set ? "[2m" : "[22m"); break;     // half intensity
-            case '2': std::cout << ESC << (set ? "[5m" : "[25m"); break;     // blinking
-            case '3': std::cout << ESC << (set ? "[4m" : "[24m"); break;     // underline
-            case '4': std::cout << ESC << (set ? "[?25h" : "[?25l"); break;  // cursor on/off
+            case '0': conctrl_esc(set ? "[7m" : "[27m"); break;     // reverse video
+            case '1': conctrl_esc(set ? "[2m" : "[22m"); break;     // half intensity
+            case '2': conctrl_esc(set ? "[5m" : "[25m"); break;     // blinking
+            case '3': conctrl_esc(set ? "[4m" : "[24m"); break;     // underline
+            case '4': conctrl_esc(set ? "[?25h" : "[?25l"); break;  // cursor on/off
             default: break;
         }
         break;
     }
     case 'D': { // ESC D - cursor left, unless at the left-hand edge
-        std::cout << ESC << "[D";
+        conctrl_esc("[D");
         break;
     }
     case 'E': { // ESC E - clear screen and home cursor
@@ -263,7 +172,7 @@ inline void console_exeb() {
         break;
     }
     case 'I': { // ESC I - cursor up, scroll down if at top
-        std::cout << ESC << 'M';
+        conctrl_esc("M");
         break;
     }
     case 'J': { // ESC J - delete to end of screen
@@ -275,15 +184,15 @@ inline void console_exeb() {
         break;
     }
     case 'L': { // ESC L - insert a line
-        std::cout << ESC << "[L";
+        conctrl_esc("[L");
         break;
     }
     case 'M': { // ESC M - delete current line
-        std::cout << ESC << "[M";
+        conctrl_esc("[M");
         break;
     }
     case 'N': { // ESC N - delete character at cursor position
-        std::cout << ESC << "[P";
+        conctrl_esc("[P");
         break;
     }
     case 'Y': case '=': { // ESC Y r c - Move cursor to row r-32, column c-32
@@ -413,15 +322,15 @@ inline void console_putc(const uint8_t c) {
         switch(a) {
             case 0x08:
             case 0x0a: {
-                putchar(a);
+                conctrl_putc(a);
                 break;
             }
             case 0x0b: { // Cursor up ....................  0Bh
-                std::cout << ESC << "[A";
+                conctrl_esc("[A");
                 break;
             }
             case 0x0c: { // Cursor right .................  0Ch
-                std::cout << ESC << "[C";
+                conctrl_esc("[C");
                 break;
             }
             case 0x17: { // Clear EOS (Ctl-W) ............  17h     23
@@ -441,7 +350,7 @@ inline void console_putc(const uint8_t c) {
                 break;
             }
             default: {
-                putchar(a);
+                conctrl_putc(a);
         //    if (a < 32) std::cout << '[' << std::hex << (unsigned)a << ']';
                 break;
             }
