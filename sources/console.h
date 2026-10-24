@@ -43,6 +43,10 @@ inline int conctrl_getch_wait();
 
 #define ESC ((char)0x1b)
 
+// Escape key for emulator commands (like telnet): Ctrl-] q leaves the emulator,
+// Ctrl-] Ctrl-] sends a Ctrl-]
+#define CONCTRL_CMD 0x1d
+
 // Terminal settings saved by conctrl_init(), restored on exit
 inline struct termios conctrl_saved_termios;
 inline bool conctrl_raw = false;
@@ -63,12 +67,13 @@ inline void conctrl_signal(int sig) {
 /**
  * Put the terminal in non-canonical mode without echo, so that keys are seen
  * as soon as they are typed (CP/M programs do their own echo).
+ * Signal keys are turned off: ^C, ^Z... belong to CP/M.
  * Nothing is done when stdin is not a terminal (e.g. piped input).
  */
 inline void conctrl_init() {
     if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &conctrl_saved_termios)) return;
     struct termios raw = conctrl_saved_termios;
-    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
     raw.c_iflag &= ~(ICRNL | IXON);   // RETURN gives CR, ^S/^Q reach the program
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
@@ -77,6 +82,7 @@ inline void conctrl_init() {
     std::atexit(conctrl_restore);
     std::signal(SIGINT, conctrl_signal);
     std::signal(SIGTERM, conctrl_signal);
+    std::cout << "[CP/M emulator: Ctrl-] q to quit]" << std::endl;
 }
 
 inline int conctrl_kbhit(void) {
@@ -98,12 +104,22 @@ inline int conctrl_status(void) {
     return conctrl_tty() && conctrl_kbhit() ? 0xFF : 0x00;
 }
 
+inline void conctrl_quit() {
+    std::cout << ESC << "[0m" << ESC << "[?25h" << std::endl;
+    std::exit(EXIT_SUCCESS);
+}
+
 /**
- * Wait for a key. Leaves the emulator when the input is exhausted.
+ * Wait for a key. Leaves the emulator when the input is exhausted,
+ * or on Ctrl-] q at a terminal.
  */
 inline int conctrl_getch_wait(void) {
     std::cout.flush();
-    const int c = getchar();
+    int c = getchar();
+    if (c == CONCTRL_CMD && conctrl_tty()) {
+        c = getchar();
+        if (c == 'q' || c == 'Q') conctrl_quit();
+    }
     switch(c) {
         case EOF: std::cout << std::endl; std::exit(EXIT_SUCCESS);
         case 10: return 13;

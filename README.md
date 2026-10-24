@@ -30,7 +30,7 @@ You may also use [GlassTTY: TrueType VT220 font](https://github.com/svofski/glas
 ```sh
 $ cpm 
 ```
-The console is a Kaypro/ADM-3A like terminal (`^Z` clear screen, `ESC = r c` cursor position...). `Ctrl-C` leaves the emulator.
+The console is a Kaypro/ADM-3A like terminal (`^Z` clear screen, `ESC = r c` cursor position...). `Ctrl-C` goes to CP/M (warm boot); `Ctrl-]` then `q` leaves the emulator (`Ctrl-]` twice sends a `Ctrl-]`).
 
 ### Start emulator, load & run a program
 The arguments are given to the program as its command line; the emulator stops when the program ends.
