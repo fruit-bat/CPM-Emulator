@@ -94,7 +94,8 @@ public:
  */
 	void init(uint8_t *const memory) {
 		memory[IOBYTE] = 0x00;			// Default IOBYTE
-		memory[USER_DRIVE] = 0x00;		// User 0, drive A
+		memory[USER_DRIVE] = 0x00;		// User 0, drive A, for the CCP
+		userDrive = 0x00;
 		vectors(memory);
 
 	// Disk Parameter Block: 2K blocks, 4M disk, 512 directory entries
@@ -448,7 +449,7 @@ protected:
 #if LOG
 		std::clog << "Reset drive ; default to A" << std::endl;
 #endif
-		memory[USER_DRIVE] &= 0xF0;	// DRIVE: 0 (A), user unchanged
+		userDrive &= 0xF0;	// DRIVE: 0 (A), user unchanged
 		dma = DEFAULT_DMA;
 	// 0FFh if a file name begins with '$' (the CCP then looks for $$$.SUB)
 		std::error_code ec;
@@ -480,7 +481,7 @@ protected:
 		}
 
 		if (std::filesystem::is_directory(drivePath(Z80_E(cpu)))) {
-			memory[USER_DRIVE] = (memory[USER_DRIVE] & 0xF0) | (Z80_E(cpu) & 0x0F);
+			userDrive = (userDrive & 0xF0) | (Z80_E(cpu) & 0x0F);
 			returnCode(cpu, 0x00);
 			return;
 		}
@@ -583,7 +584,7 @@ protected:
 
 		found.clear();
 		nextFound = 0;
-		const auto path = drivePath(fcbDrive(pFCB, memory));
+		const auto path = drivePath(fcbDrive(pFCB));
 		std::error_code ec;
 		std::filesystem::directory_iterator di(path, ec);
 		if (ec) {
@@ -637,7 +638,7 @@ protected:
 
 		uint8_t *const entry = memory + dma;
 		memset(entry, 0, DIR_ENTRY_SIZE);
-		entry[0] = memory[USER_DRIVE] >> 4;			// User number
+		entry[0] = userDrive >> 4;			// User number
 		memcpy(entry + 1, e.name, sizeof(e.name));
 		entry[12] = e.extent % EXTENTS_PER_MODULE;	// EX
 		entry[14] = e.extent / EXTENTS_PER_MODULE;	// S2
@@ -663,7 +664,7 @@ protected:
 		char filter[11];
 		fcbName(pFCB, filter);
 
-		const auto path = drivePath(fcbDrive(pFCB, memory));
+		const auto path = drivePath(fcbDrive(pFCB));
 		std::error_code ec;
 		std::filesystem::directory_iterator di(path, ec);		// New directory_iterator
 		if (ec) {
@@ -799,7 +800,7 @@ protected:
 		assert(memory);
 		const FCB_t *const pFCB1 = fcbAt(memory, Z80_DE(cpu));
 		const FCB_t *const pFCB2 = fcbAt(memory, Z80_DE(cpu) + 16);
-		const auto drive = fcbDrive(pFCB1, memory);
+		const auto drive = fcbDrive(pFCB1);
 		char name1[11], name2[11];
 		fcbName(pFCB1, name1);
 		fcbName(pFCB2, name2);
@@ -850,9 +851,9 @@ protected:
  	void returnCurrentDisk(Z80& cpu, const uint8_t memory[]) {
 		assert(memory);
 #if LOG
-		std::clog << "Get drive (" << char('A' + (memory[USER_DRIVE] & 0x0F)) << ')' << std::endl;
+		std::clog << "Get drive (" << char('A' + (userDrive & 0x0F)) << ')' << std::endl;
 #endif
-		returnCode(cpu, (memory[USER_DRIVE] & 0x0F));	// ok - drive numb.
+		returnCode(cpu, (userDrive & 0x0F));	// ok - drive numb.
 	}
 
 /**
@@ -946,14 +947,14 @@ protected:
 		assert(memory);
 		if (Z80_E(cpu) == 0xFF) {
 #if LOG
-			std::clog << "Get user number (" << unsigned(memory[USER_DRIVE] >> 4) << ")" << std::endl;
+			std::clog << "Get user number (" << unsigned(userDrive >> 4) << ")" << std::endl;
 #endif
-			returnCode(cpu, memory[USER_DRIVE] >> 4);	// OK - user numb.
+			returnCode(cpu, userDrive >> 4);	// OK - user numb.
 		} else {
 #if LOG
 			std::clog << "Set user number to " << unsigned(Z80_E(cpu)) << std::endl;
 #endif
-			memory[USER_DRIVE] = (memory[USER_DRIVE] & 0x0F) | (Z80_E(cpu) << 4);
+			userDrive = (userDrive & 0x0F) | (Z80_E(cpu) << 4);
 			returnCode(cpu, 0);	// OK
 		}
 	}
@@ -1145,7 +1146,7 @@ protected:
 			return nullptr;
 		}
 		pFile->fcb = aFCB;
-		pFile->drive = fcbDrive(pFCB, memory);
+		pFile->drive = fcbDrive(pFCB);
 		fcbName(pFCB, pFile->name);
 		pFile->path = path;
 		pFile->used = ++useCounter;
@@ -1161,7 +1162,7 @@ protected:
 		char name[11];
 		fcbName(pFCB, name);
 		OpenFile *const pFile = findStream(aFCB);
-		if (pFile && pFile->drive == fcbDrive(pFCB, memory) && !memcmp(pFile->name, name, sizeof(name))) {
+		if (pFile && pFile->drive == fcbDrive(pFCB) && !memcmp(pFile->name, name, sizeof(name))) {
 			pFile->used = ++useCounter;
 			return pFile;
 		}
@@ -1296,8 +1297,8 @@ protected:
 /**
  * Drive used by a FCB: its own or the current one.
  */
-	static unsigned fcbDrive(const FCB_t *const pFCB, const uint8_t memory[]) {
-		return (pFCB->DR && pFCB->DR != '?') ? (pFCB->DR - 1) & 0x0F : memory[USER_DRIVE] & 0x0F;
+	unsigned fcbDrive(const FCB_t *const pFCB) const {
+		return (pFCB->DR && pFCB->DR != '?') ? (pFCB->DR - 1) & 0x0F : userDrive & 0x0F;
 	}
 
 /**
@@ -1346,7 +1347,7 @@ protected:
 	std::filesystem::path hostPath(const FCB_t *const pFCB, const uint8_t memory[]) const {
 		char name[11];
 		fcbName(pFCB, name);
-		return hostPath(fcbDrive(pFCB, memory), name);
+		return hostPath(fcbDrive(pFCB), name);
 	}
 
 /**
@@ -1443,6 +1444,12 @@ private:
  * DMA's address.
  */
 	uint16_t dma = DEFAULT_DMA;
+
+/**
+ * Current user (H) & drive (L). The page zero copy belongs to the CCP: a
+ * program selecting a drive must not change the one the CCP returns to.
+ */
+	uint8_t userDrive = 0x00;
 
 /**
  * Files found by searchForFirst, and next one to return.
