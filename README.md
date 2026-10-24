@@ -17,24 +17,10 @@ Tested with ZEXDOC from http://mdfs.net/Software/Z80/Exerciser/
   
 ## Installation
 
-<!--
-OS X & Linux:
-
-```sh
-npm install my-crazy-module --save
-```
-
-Windows:
-
-```sh
-edit autoexec.bat
-```
--->
-
 Copy localy the CCP-DR.64K file from https://github.com/MockbaTheBorg/RunCPM/tree/master/CCP
-or another CCP version and change loading & running parameters accordingly in source code ([main.cpp#L45](https://github.com/Marcussacapuces91/CPM-Emulator/blob/main/sources/main.cpp#L45) )
+in the directory you start the emulator from.
 
-Create dir /A, /B, _etc._ as you need. They will simulate local CP/M disks. Only files with 8+3 filename will be seenable. Try `DIR a:`.
+Create dir A, B, _etc._ (up to P) as you need. They will simulate local CP/M disks. Only files with 8+3 filename will be seenable, whatever their case. Try `DIR a:`.
 
 You may also use [GlassTTY: TrueType VT220 font](https://github.com/svofski/glasstty).
 
@@ -44,10 +30,13 @@ You may also use [GlassTTY: TrueType VT220 font](https://github.com/svofski/glas
 ```sh
 $ cpm 
 ```
+The console is a Kaypro/ADM-3A like terminal (`^Z` clear screen, `ESC = r c` cursor position...). `Ctrl-C` leaves the emulator.
 
-### Start emulator, load & run zexdoc.com file
+### Start emulator, load & run a program
+The arguments are given to the program as its command line; the emulator stops when the program ends.
 ```sh
 $ cpm zexdoc.com
+$ cpm A/DUMP.COM B:FILE.TXT
 
 Zilog Z80 CPU Emulator
 Copyright (c) 1999-2018 Manuel Sainz de Baranda y Goni.
@@ -56,10 +45,11 @@ Released under the terms of the GNU General Public License v3.
 CPM 2.2 Emulator - Copyright (c) 2021 by M. Sibert
 
 Z80doc instruction exerciser
-<adc,sbc> hl,<bc,de,hl,sp>....
+<adc,sbc> hl,<bc,de,hl,sp>....  OK
 
 ```
 
+Input can be piped (`printf 'DIR\n' | cpm`): the emulator stops at the end of input.
 
 <!--
 A few motivating and useful examples of how your product can be used. Spice this up with code blocks and potentially more screenshots.
@@ -69,28 +59,26 @@ _For more examples and usage, please refer to the [Wiki][wiki]._
 
 ## Development setup
 
-* Installer le code disponible dans ce repository. 
-* Ajouter le code de https://github.com/redcode/Z80 ([licence GNU Public Licence v3](http://www.gnu.org/copyleft/gpl.html)) :
+Needs CMake, and a C++17 compiler. The Z80 emulator https://github.com/redcode/Z80 ([licence GNU Public Licence v3](http://www.gnu.org/copyleft/gpl.html)) and its Zeta library are Git submodules.
 
-  Copier les fichiers suivant dans le répertoire /source :
-    * [Z80.h](https://github.com/redcode/Z80/blob/master/API/emulation/CPU/Z80.h) et 
-    * [Z80.c](https://github.com/redcode/Z80/blob/master/sources/Z80.c).
-  
-  Vous pouvez modifier `Z80.h` selon la proposition https://github.com/redcode/Z80/pull/3 pour éviter des _warnings_.
-
-
-* Ajouter aussi le code, sur la base du commentaire (https://github.com/redcode/Z/issues/3#issuecomment-520175069) pour remplacer la [lib Z](https://github.com/redcode/Z) qui ne compile pas sous GCC :
-    * [Z80-support.h](https://github.com/simonowen/tilemap/blob/master/Z80-support.h)
-
-<!--
 ```sh
-make install
-npm test
+git clone --recursive https://github.com/Marcussacapuces91/CPM-Emulator.git
+cd CPM-Emulator
+cmake -S . -B build
+cmake --build build
 ```
--->
+
+In an existing clone, get the submodules with `git submodule update --init`.
+
+The console uses POSIX terminal functions (Linux, macOS).
 
 ## Release History
 
+* 0.3
+    * CHANGE: Build with CMake, Z80 as a submodule ;
+    * All CP/M 2.2 BDOS functions (0-40) & BIOS entries ;
+    * Console in raw mode, Kaypro escape sequences ;
+    * Passes the ZEXDOC tests.
 * 0.2
     * CHANGE: Remplacement par le moteur https://github.com/redcode/Z80 ;
     * CHANGE: Reprise de l'affichage des mnemonics ;

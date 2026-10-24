@@ -16,87 +16,155 @@
 
 #pragma once
 
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <csignal>
+#include <iostream>
 #include <termios.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
 
-void conctrl_save_cursor_pos();
-void conctrl_restore_cursor_pos();
-void conctrl_mono_mode();
-void conctrl_mono80_mode();
-void conctrl_home();
-void conctrl_cls();
-void conctrl_clear_to_end_of_line();
-void conctrl_clear_to_end_of_screen();
-void conctrl_black_text_on_white();
-void conctrl_white_text_on_black();
-void conctrl_move_cursor(const uint8_t x, const uint8_t y);
-int conctrl_kbhit();
-int conctrl_getch();
+inline void conctrl_save_cursor_pos();
+inline void conctrl_restore_cursor_pos();
+inline void conctrl_mono_mode();
+inline void conctrl_mono80_mode();
+inline void conctrl_home();
+inline void conctrl_cls();
+inline void conctrl_clear_to_end_of_line();
+inline void conctrl_clear_to_end_of_screen();
+inline void conctrl_black_text_on_white();
+inline void conctrl_white_text_on_black();
+inline void conctrl_move_cursor(const uint8_t x, const uint8_t y);
+inline int conctrl_kbhit();
+inline int conctrl_getch();
+inline int conctrl_getch_wait();
 
 #define ESC ((char)0x1b)
 
-int conctrl_kbhit(void) {
-	int characters_buffered;
+// Terminal settings saved by conctrl_init(), restored on exit
+inline struct termios conctrl_saved_termios;
+inline bool conctrl_raw = false;
+
+inline void conctrl_restore() {
+    if (conctrl_raw) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &conctrl_saved_termios);
+        conctrl_raw = false;
+    }
+}
+
+inline void conctrl_signal(int sig) {
+    conctrl_restore();
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+/**
+ * Put the terminal in non-canonical mode without echo, so that keys are seen
+ * as soon as they are typed (CP/M programs do their own echo).
+ * Nothing is done when stdin is not a terminal (e.g. piped input).
+ */
+inline void conctrl_init() {
+    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &conctrl_saved_termios)) return;
+    struct termios raw = conctrl_saved_termios;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_iflag &= ~(ICRNL | IXON);   // RETURN gives CR, ^S/^Q reach the program
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw)) return;
+    conctrl_raw = true;
+    std::atexit(conctrl_restore);
+    std::signal(SIGINT, conctrl_signal);
+    std::signal(SIGTERM, conctrl_signal);
+}
+
+inline int conctrl_kbhit(void) {
+	int characters_buffered = 0;
 	ioctl(STDIN_FILENO, FIONREAD, &characters_buffered);
 	return characters_buffered;
 }
 
-int conctrl_getch(void) {
-	if (!conctrl_kbhit()) return 0;
+inline bool conctrl_tty() {
+    static const bool tty = isatty(STDIN_FILENO);
+    return tty;
+}
+
+/**
+ * Console status (BDOS 11 / BIOS CONST). Programs poll it to stop on a key
+ * press, which would eat piped input: then it never reports a key.
+ */
+inline int conctrl_status(void) {
+    return conctrl_tty() && conctrl_kbhit() ? 0xFF : 0x00;
+}
+
+/**
+ * Wait for a key. Leaves the emulator when the input is exhausted.
+ */
+inline int conctrl_getch_wait(void) {
+    std::cout.flush();
     const int c = getchar();
     switch(c) {
+        case EOF: std::cout << std::endl; std::exit(EXIT_SUCCESS);
         case 10: return 13;
         default: return c;
     }
 }
 
-void conctrl_save_cursor_pos() {
+/**
+ * Return a key if one is waiting, 0 otherwise.
+ * Piped input is all typed ahead: wait for it, so that its end is seen.
+ */
+inline int conctrl_getch(void) {
+	if (conctrl_tty() && !conctrl_kbhit()) return 0;
+    return conctrl_getch_wait();
+}
+
+inline void conctrl_save_cursor_pos() {
     std::cout << ESC << "[s";
 }
 
-void conctrl_restore_cursor_pos() {
+inline void conctrl_restore_cursor_pos() {
     std::cout << ESC << "[u";
 }
 
-void conctrl_mono_mode() {
+inline void conctrl_mono_mode() {
     // ESC[=0h	40 x 25 monochrome (text)
     std::cout << ESC << "[=0h";
 }
 
-void conctrl_mono80_mode() {
+inline void conctrl_mono80_mode() {
     // ESC[=2h	80 x 25 monochrome (text)
     std::cout << ESC << "[=2h";
 }
 
-void conctrl_home() {
+inline void conctrl_home() {
     std::cout << ESC << "[H";
 }
 
-void conctrl_cls(){
+inline void conctrl_cls(){
     std::cout << ESC << "[2J" << ESC << "[H";
 }
 
-void conctrl_black_text_on_white() {
+inline void conctrl_black_text_on_white() {
     std::cout << ESC << "[0m";
     std::cout << ESC << "[7m";
 }
 
-void conctrl_white_text_on_black() {
+inline void conctrl_white_text_on_black() {
     std::cout << ESC << "[0m";
 }
 
-void conctrl_move_cursor(const uint8_t row, const uint8_t col) {
-    std::cout << ESC << "[" << (unsigned)row << ';' <<  (unsigned)col << 'H';
+// row & col from 0, ANSI counts from 1
+inline void conctrl_move_cursor(const uint8_t row, const uint8_t col) {
+    std::cout << ESC << "[" << (unsigned)row + 1 << ';' <<  (unsigned)col + 1 << 'H';
 }
 
-void conctrl_clear_to_end_of_line() {
+inline void conctrl_clear_to_end_of_line() {
     std::cout << ESC << "[0K";
 }
 
-void conctrl_clear_to_end_of_screen() {
+inline void conctrl_clear_to_end_of_screen() {
     std::cout << ESC << "[0J";
 }
 
@@ -107,14 +175,14 @@ void conctrl_clear_to_end_of_screen() {
 //
 // Buffer console output so we can execute control sequences
 // TODO need a way to reset these
-static uint8_t conb[4];
-static unsigned coni = 0; 
+inline uint8_t conb[4];
+inline unsigned coni = 0;
 
-void console_reset() {
+inline void console_reset() {
     coni = 0; 
 }
 
-unsigned console_el() {
+inline unsigned console_el() {
     switch(conb[1]) {
         case 'Y':
         case 'd':
@@ -128,53 +196,80 @@ unsigned console_el() {
         case 'a': 
         case 'b':
         case 'c':
+        case 'B':
+        case 'C':
             return 3;
         default: return 2;
     }
 }
 
-void console_output_buf() {
-    for(int i = 0; i < coni; ++i) {
-        std::cout << '(' << std::hex << (unsigned)conb[i] << ')';
-        if (i > 0) {
-            std::cout << (char)conb[i];
-        }
+// Unknown sequence: pass it through untouched
+inline void console_output_buf() {
+    for(unsigned i = 0; i < coni; ++i) {
+        std::cout << (char)conb[i];
     }
 }
 
-void console_exeb() {
+inline void console_exeb() {
 
     switch(conb[1]) {
 // ESC 0
 // disable the status line (containing the clock).
 // ESC 1
 // enable the status line.
-// ESC A
-// cursor up, unless at the top
-// ESC B
-// cursor down, unless at the bottom
-// ESC C
-// cursor right, unless at the right-hand edge
-// ESC D
-// cursor left, unless at the left-hand edge
+    case 'A': { // ESC A - cursor up, unless at the top
+        std::cout << ESC << "[A";
+        break;
+    }
+    case 'B':   // ESC B n - Kaypro: set attribute n
+    case 'C': { // ESC C n - Kaypro: clear attribute n
+        const bool set = conb[1] == 'B';
+        switch(conb[2]) {
+            case '0': std::cout << ESC << (set ? "[7m" : "[27m"); break;     // reverse video
+            case '1': std::cout << ESC << (set ? "[2m" : "[22m"); break;     // half intensity
+            case '2': std::cout << ESC << (set ? "[5m" : "[25m"); break;     // blinking
+            case '3': std::cout << ESC << (set ? "[4m" : "[24m"); break;     // underline
+            case '4': std::cout << ESC << (set ? "[?25h" : "[?25l"); break;  // cursor on/off
+            default: break;
+        }
+        break;
+    }
+    case 'D': { // ESC D - cursor left, unless at the left-hand edge
+        std::cout << ESC << "[D";
+        break;
+    }
     case 'E': { // ESC E - clear screen and home cursor
         conctrl_cls();
         break;
     }
-// ESC H
-// home cursor
-// ESC I
-// cursor up, scroll down if at top
-// ESC J
-// delete to end of screen
-// ESC K
-// delete to end of line
-// ESC L
-// insert a line, moving current line and all lines below down by 1
-// ESC M
-// delete current line, moving all lines below up by 1
-// ESC N
-// delete character at cursor position, moving all characters right of it one character to the left
+    case 'H': { // ESC H - home cursor
+        conctrl_home();
+        break;
+    }
+    case 'I': { // ESC I - cursor up, scroll down if at top
+        std::cout << ESC << 'M';
+        break;
+    }
+    case 'J': { // ESC J - delete to end of screen
+        conctrl_clear_to_end_of_screen();
+        break;
+    }
+    case 'K': { // ESC K - delete to end of line
+        conctrl_clear_to_end_of_line();
+        break;
+    }
+    case 'L': { // ESC L - insert a line
+        std::cout << ESC << "[L";
+        break;
+    }
+    case 'M': { // ESC M - delete current line
+        std::cout << ESC << "[M";
+        break;
+    }
+    case 'N': { // ESC N - delete character at cursor position
+        std::cout << ESC << "[P";
+        break;
+    }
     case 'Y': case '=': { // ESC Y r c - Move cursor to row r-32, column c-32
         conctrl_move_cursor(
             conb[2] - 32,
@@ -268,7 +363,7 @@ void console_exeb() {
     coni = 0;
 }
 
-void console_chkb() {
+inline void console_chkb() {
     if (coni >= 2 && conb[0] == 0x1b) {
         unsigned el = console_el();
         if (coni >= el) {
@@ -284,7 +379,7 @@ inline void console_pushc(const uint8_t c) {
     console_chkb();
 }
 
-void console_putc(const uint8_t c) {
+inline void console_putc(const uint8_t c) {
     const uint8_t a = c & 127; // remove parity?
     if (a == 0x1b || coni > 0) {
         console_pushc(a);
@@ -301,12 +396,17 @@ void console_putc(const uint8_t c) {
 //         Clear EOS (Ctl-W) ............  17h     23
         switch(a) {
             case 0x08:
-            case 0x0c:
-            case 0x0a:
-            case 0x0b: {
+            case 0x0a: {
                 putchar(a);
-             //   std::cout << '[' << std::hex << (unsigned)a << ']';
-                break; 
+                break;
+            }
+            case 0x0b: { // Cursor up ....................  0Bh
+                std::cout << ESC << "[A";
+                break;
+            }
+            case 0x0c: { // Cursor right .................  0Ch
+                std::cout << ESC << "[C";
+                break;
             }
             case 0x17: { // Clear EOS (Ctl-W) ............  17h     23
                 conctrl_clear_to_end_of_screen();

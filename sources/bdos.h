@@ -12,25 +12,22 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- * 
+ *
  * See http://www.gaby.de/cpm/manuals/archive/cpm22htm/ch5.htm
  */
 
 #pragma once
 
-// #include "Z80.h"
-
-// #include <dirent.h>
-// #include <sys/stat.h>
+#include <cassert>
+#include <cctype>
 #include <cstring>
-#include <termios.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <sys/ioctl.h>
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <vector>
 #include "console.h"
-
-// #include <iostream>
-// #include <iomanip>
 
 #if __cplusplus < 201703L
 #error "Need C++17 compiler for using <filesystem>"
@@ -38,8 +35,6 @@
 #include <filesystem>
 
 // #define LOG 1
-
-
 
 /**
  * CP/M File Control Block
@@ -50,22 +45,22 @@
  * S2 = extent high byte, ie (file pointer / 524288). The CP/M Plus source code refers to this use of the S2 byte as 'module number'.
  */
 struct __attribute__ ((packed)) FCB_t {
-// Drive. 0 for default, 1-16 for A-P. 
+// Drive. 0 for default, 1-16 for A-P.
 	uint8_t DR;
 /**
  * Filename, 7-bit ASCII. The top bits of the filename bytes (usually referred to as F1' to F8') have the following meanings:
  *   F1'-F4' - User-defined attributes. Any program can use them in any way it likes. The filename in the disc directory has the corresponding bits set.
  *   F5'-F8' - Interface attributes. They modify the behaviour of various BDOS functions or indicate error conditions. In the directory these bits are always zero.
- */                        
+ */
 	char filename[8];
 /**
  * Filetype, 7-bit ASCII. T1' to T3' have the following meanings:
- *   T1' - Read-Only. 
+ *   T1' - Read-Only.
  *   T2' - System (hidden). System files in user 0 can be opened from other user areas.
  *   T3' - Archive. Set if the file has not been changed since it was last copied.
- */					
+ */
 	char filetype[3];
-// Set this to 0 when opening a file and then leave it to CP/M. You can rewind a file by setting EX, RC, S2 and CR to 0. 
+// Set this to 0 when opening a file and then leave it to CP/M. You can rewind a file by setting EX, RC, S2 and CR to 0.
 	uint8_t EX;
 // Reserved.
 	uint8_t S1;
@@ -81,41 +76,69 @@ struct __attribute__ ((packed)) FCB_t {
 	uint8_t R[3];
 };
 
+static_assert(sizeof(FCB_t) == 36, "FCB must be 36 bytes");
 
+/**
+ * Emulated BDOS. Disks A: to P: are the host directories "A" to "P" in the
+ * current directory; files are host files with a 8.3 name.
+ *
+ * The BDOS area (BDOS_ADDR) holds, after the 6 bytes signature, a fake Disk
+ * Parameter Block and allocation vector (0x120 bytes in all) for programs
+ * like STAT that look at them.
+ */
 template <unsigned MEMORY_SIZE, uint16_t BDOS_ADDR>
 class BDos {
 public:
+/**
+ * Cold boot: set page zero, the BDOS signature and the disk parameters.
+ */
 	void init(uint8_t *const memory) {
-		memory[0x0003] = 0;				// Default drive: 0=A
-		memory[0x0004] = 0xD3;			// Default IOBYTE: 0 ou D3 ???
-		
-	// WARM BOOT (BDOS entry bdose)
-		memory[0x0005] = 0xC3;						// JUMP
-		memory[0x0006] = (BDOS_ADDR + 6) & 0xFF;	// BDOS+6 (LL)
-		memory[0x0007] = (BDOS_ADDR + 6) >> 8;		// BDOS+6 (HH)
-		
-	// BDOS signature shall be tested by CCP
-		memory[BDOS_ADDR + 0] = 0x00;			// BDOS SIGNATURE
-		memory[BDOS_ADDR + 1] = 0x16;			// CPM ver 22 dec.
-		memory[BDOS_ADDR + 2] = 0x00;
-		memory[BDOS_ADDR + 3] = 0x00;
-		memory[BDOS_ADDR + 4] = 0x00;
-		memory[BDOS_ADDR + 5] = 0x00;
+		memory[IOBYTE] = 0x00;			// Default IOBYTE
+		memory[USER_DRIVE] = 0x00;		// User 0, drive A
+		vectors(memory);
+
+	// Disk Parameter Block: 2K blocks, 4M disk, 512 directory entries
+		static const uint8_t dpb[] = {
+			64, 0,			// SPT - sectors per track
+			4, 15, 0,		// BSH, BLM, EXM
+			0xFF, 0x07,		// DSM - last block number (2047)
+			0xFF, 0x01,		// DRM - last directory entry (511)
+			0xFF, 0x00,		// AL0, AL1 - blocks used by the directory
+			0, 0,			// CKS - not removable
+			0, 0			// OFF - no system track
+		};
+		memcpy(memory + DPB_ADDR, dpb, sizeof(dpb));
+		memset(memory + ALV_ADDR, 0, ALV_SIZE);
+		memory[ALV_ADDR] = 0xFF;				// Directory blocks
 	}
-	
+
+/**
+ * Warm boot: restore the BDOS entry, close all files and reset the DMA.
+ */
+	void reset(uint8_t *const memory) {
+		vectors(memory);
+		for (auto& f : files) release(f);
+		found.clear();
+		dma = DEFAULT_DMA;
+	}
+
 /**
  * BDOS functions.
  * C register contains the function value.
  * @see http://www.gaby.de/cpm/manuals/archive/cpm22htm/ch5.htm
- */	
+ */
 	void function(Z80& cpu, uint8_t *const memory) {
 		assert(memory);
 		switch (Z80_C(cpu)) {
 			case 0x00 : systemReset(cpu); break;
 			case 0x01 : consoleInput(cpu); break;
 			case 0x02 : consoleOutput(cpu); break;
+			case 0x03 : readerInput(cpu); break;
+			case 0x04 : punchOutput(cpu); break;
+			case 0x05 : listOutput(cpu); break;
 			case 0x06 : directConsoleIO(cpu); break;
 			case 0x07 : getIOByte(cpu, memory); break;
+			case 0x08 : setIOByte(cpu, memory); break;
 			case 0x09 : printString(cpu, memory); break;
 			case 0x0A : readConsoleBuffer(cpu, memory); break;
 			case 0x0B : getConsoleStatus(cpu); break;
@@ -134,21 +157,31 @@ public:
 			case 0x18 : returnLogicVector(cpu); break;
 			case 0x19 : returnCurrentDisk(cpu, memory); break;
 			case 0x1A : setDMAAddress(cpu); break;
+			case 0x1B : getAddrAlloc(cpu); break;
+			case 0x1C : writeProtectDisk(cpu); break;
 			case 0x1D : getROVector(cpu); break;
-			case 0x1F : break; // Get Addr (DPB)               none           HL= .DPB
+			case 0x1E : setFileAttributes(cpu, memory); break;
+			case 0x1F : getAddrDiskParms(cpu); break;
 			case 0x20 : setGetUserCode(cpu, memory); break;
 			case 0x21 : readRandom(cpu, memory); break;
+			case 0x22 : writeRandom(cpu, memory); break;
+			case 0x23 : computeFileSize(cpu, memory); break;
 			case 0x24 : setRandomRecord(cpu, memory); break;
+			case 0x25 : resetDrive(cpu); break;
+			case 0x28 : writeRandomWithZeroFill(cpu, memory); break;
 			default:
-				std::cerr << "Register C: " << std::hex << std::setw(2) << std::setfill('0') << unsigned(Z80_C(cpu)) << "h";
-				std::cerr << ": Unknown BDOS function!" << std::endl;
-				throw std::runtime_error("Un-emulated BDOS function");
+	// Like CP/M 2.2, unknown functions (eg. CP/M 3 ones) return 0
+#if LOG
+				std::clog << "Register C: " << std::hex << std::setw(2) << std::setfill('0') << unsigned(Z80_C(cpu)) << "h";
+				std::clog << ": Unknown BDOS function!" << std::endl;
+#endif
+				returnCode(cpu, 0);
 				break;
 		}
 	}
-	
+
 protected:
-	
+
 /**
  * BDOS function 0 (P_TERMCPM) - System Reset
  * Supported by: CP/M 1, 2, 3; MP/M; Concurrent CP/M.
@@ -166,7 +199,8 @@ protected:
  * Wait for a character from the keyboard; then echo it to the screen and return it.
  */
 	void consoleInput(Z80& cpu) {
-		const auto c = std::cin.get();
+		const auto c = conctrl_getch_wait();
+		if (c >= ' ' || c == 0x0D || c == 0x0A || c == 0x08 || c == 0x09) console_putc(c);
 		returnCode(cpu, c);
 	}
 
@@ -192,31 +226,41 @@ protected:
 		unsigned e = Z80_E(cpu);
 		if (e) console_putc(e);
 		returnCode(cpu, 0);
-	}		
-	
+	}
+
 /**
  * BDOS function 3 (A_READ) - Auxiliary (Reader) input
  * Supported by: All CP/M versions except MP/M and Concurrent CP/M
  * Entered with C=3. Returns A=L=ASCII character
  * Note that this call can hang if the auxiliary input never sends data.
+ * No reader is emulated: always returns ^Z (end of file).
  */
-	void readerInput();
-	
+	void readerInput(Z80& cpu) {
+		returnCode(cpu, 0x1A);
+	}
+
 /**
  * BDOS function 4 (A_WRITE) - Auxiliary (Punch) output
  * Supported by: All versions except MP/M and Concurrent CP/M.
  * Entered with C=4, E=ASCII character.
  * If the device is permanently not ready, this call can hang.
+ * No punch is emulated: the character is discarded.
  */
-	void punchOutput();
-	
+	void punchOutput(Z80& cpu) {
+		returnCode(cpu, 0);
+	}
+
 /**
  * BDOS function 5 (L_WRITE) - Printer output
  * Supported by: All versions
  * Entered with C=2, E=ASCII character.
  * If the printer is permanently offline or busy, this call can hang.
+ * No printer is emulated: the character is discarded.
  */
-	void listOutput();
+	void listOutput(Z80& cpu) {
+		returnCode(cpu, 0);
+	}
+
 /**
  * BDOS function 6 (C_RAWIO) - Direct console I/O
  * Supported by: CP/M 1.4 and later, with variations
@@ -232,17 +276,18 @@ protected:
  * Values of E not supported on a particular system will output the character. Under CP/M 2 and lower, direct console functions may interact undesirably with non-direct ones, since certain buffers may be bypassed. Do not mix them.
  */
 	void directConsoleIO(Z80& cpu) {
-	//	std::clog << std::endl << " directConsoleIO " << std::hex << (unsigned)(Z80_E(cpu)) << std::endl;
-
-		unsigned e = Z80_E(cpu) ;
-		if (e == 0xFF) {
-			returnCode(cpu, conctrl_getch());
-		} else {
-			console_putc(e);
-			returnCode(cpu, 0x00);	// ok
+		const unsigned e = Z80_E(cpu);
+		switch (e) {
+			case 0xFF : returnCode(cpu, conctrl_getch()); break;
+			case 0xFE : returnCode(cpu, conctrl_kbhit() ? 0xFF : 0x00); break;
+			case 0xFD : returnCode(cpu, conctrl_getch_wait()); break;
+			default:
+				console_putc(e);
+				returnCode(cpu, 0x00);	// ok
+				break;
 		}
 	}
-	
+
 /**
  * BDOS function 7 - Get I/O byte
  * Supported by: CP/M 2 and lookalikes. Not supported in MP/M.
@@ -250,21 +295,26 @@ protected:
  * Here's a description of how the IOBYTE works. @see https://seasip.info/Cpm/iobyte.html
  */
 	void getIOByte(Z80& cpu, const uint8_t memory[]) {
-		std::clog << "Get I/O byte " << std::hex << memory[4] << "h" << std::endl;
-		returnCode(cpu, memory[4]); // A reg 
+#if LOG
+		std::clog << "Get I/O byte " << std::hex << unsigned(memory[IOBYTE]) << "h" << std::endl;
+#endif
+		returnCode(cpu, memory[IOBYTE]); // A reg
 	}
-	
+
 /**
  * BDOS function 8 - Set I/O byte
  * Supported by: CP/M 2 and lookalikes. Not supported in MP/M.
  * Entered with C=8, E=I/O byte.
  * Here's a description of how the IOBYTE works.
  */
-	void setIOByte(Z80& cpu, const uint8_t memory[]) {
-		std::clog << "Set I/O byte " << std::hex << Z80_E(cpu) << "h" << std::endl;
-		memory[4] = Z80_E(cpu);
+	void setIOByte(Z80& cpu, uint8_t memory[]) {
+#if LOG
+		std::clog << "Set I/O byte " << std::hex << unsigned(Z80_E(cpu)) << "h" << std::endl;
+#endif
+		memory[IOBYTE] = Z80_E(cpu);
+		returnCode(cpu, 0);
 	}
-	
+
 /**
  * BDOS function 9 (C_WRITESTR) - Output string
  * Supported by: All versions
@@ -277,13 +327,13 @@ protected:
 #if LOG
 		std::clog << "Output string (Buffer " << std::hex << Z80_DE(cpu) << "h)" << std::endl;
 #endif
-		const auto* c = memory + Z80_DE(cpu);
-		while (*c != '$') {
-			console_putc(*(c++));
+		uint16_t addr = Z80_DE(cpu);
+		for (auto n = 0U; n < MEMORY_SIZE * 1024U && memory[addr] != '$'; ++n) {
+			console_putc(memory[addr++]);
 		}
 		returnCode(cpu, 0);
 	}
-	
+
 /**
  * BDOS function 10 (C_READSTR) - Buffered console input
  * Supported by: All versions, with variations
@@ -297,21 +347,50 @@ protected:
  * The value at buffer+0 is the amount of bytes available in the buffer. Once the limit has been reached, no more can be added, although the line editor can still be used.
  * If DE=0 (in 16-bit versions, DX=0FFFFh) the next byte contains the number of bytes already in the buffer; otherwise this is ignored. On return from the function, it contains the number of bytes present in the buffer.
  * The bytes typed then follow. There is no end marker.
+ * Editing: BS/DEL erase a character, ^U/^X erase the line, ^C on an empty line warm boots.
  */
 	void readConsoleBuffer(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
 #if LOG
 		std::clog << "Buffered console input (Buffer " << std::hex << Z80_DE(cpu) << "h)" << std::endl;
-//			std::clog << "mx" << unsigned(memory[DE+0]) << std::endl;
-//			std::clog << "nc" << unsigned(memory[DE+1]) << std::endl;
-#endif			
-		std::string line;
-		std::getline(std::cin, line);
-		line = line.substr(0, memory[Z80_DE(cpu)]);
-
-		memory[Z80_DE(cpu) + 1] = line.length();
-		auto* s = memory + Z80_DE(cpu) + 2;
-		for (auto& i : line) *(s++) = i;
+#endif
+		const uint16_t buffer = Z80_DE(cpu);
+		const unsigned max = memory[buffer];
+		unsigned len = 0;
+		auto at = [&](unsigned i) -> uint8_t& { return memory[uint16_t(buffer + 2 + i)]; };
+		auto echo = [](uint8_t c) {
+			if (c < ' ') {
+				console_putc('^');
+				console_putc(c + '@');
+			} else console_putc(c);
+		};
+		auto erase = [&]() {
+			const auto n = at(--len) < ' ' ? 2 : 1;
+			for (auto i = 0; i < n; ++i) {
+				console_putc(0x08);
+				console_putc(' ');
+				console_putc(0x08);
+			}
+		};
+		while (true) {
+			const int c = conctrl_getch_wait();
+			if (c == 0x0D || c == 0x0A) {
+				console_putc(0x0D);
+				break;
+			}
+			if (c == 0x08 || c == 0x7F) {
+				if (len) erase();
+			} else if (c == 0x15 || c == 0x18) {
+				while (len) erase();
+			} else if (c == 0x03 && len == 0) {
+				Z80_PC(cpu) = 0x0000;	// Warm boot
+				return;
+			} else if (len < max) {
+				at(len++) = c;
+				echo(c);
+			}
+		}
+		memory[uint16_t(buffer + 1)] = len;
 		returnCode(cpu, 0);
 	}
 
@@ -325,10 +404,9 @@ protected:
 #if LOG
 		std::clog << "Console status" << std::endl;
 #endif
-		char c;
-		returnCode(cpu, conctrl_kbhit() ? 0xff : 0x00);
+		returnCode(cpu, conctrl_status());
 	}
-	
+
 /**
  * BDOS function 12 (S_BDOSVER) - Return version number
  * Supported by: Versions 2.0 and later
@@ -338,7 +416,7 @@ protected:
  *	0 - 8080			Bit 0 set for MP/M		00h - Version 1 (see Lift Head above)
  *	1 - 8086			Bit 1 set for CP/Net	20h - Version 2.0
  *	2 - 68000/Z8000		(ie:network present)	21h - Version 2.1
- *						Bit 2 set in 16-bit		22h - Version 2.2 
+ *						Bit 2 set in 16-bit		22h - Version 2.2
  *						multi-user OSes			25h - Version 2.5 (DOS +)
  *												28h - Version 2.8 (Personal CP/M-80)
  *						For plain CP/M,			30h - Version 3.0 (MP/M II, MP/M-86)
@@ -356,31 +434,39 @@ protected:
 #endif
 		returnCode(cpu, 0x0022);	// hard coded CPM 2.2
 	}
-	
+
 /**
  * BDOS function 13 (DRV_ALLRESET) - Reset discs
  * Supported by: All versions.
  * Entered with C=0Dh. Returned values vary.
  * Resets disc drives. Logs out all discs and empties disc buffers. Sets the currently selected drive to A:. Any drives set to Read-Only in software become Read-Write; replacement BDOSses tend to leave them Read-Only.
  * In versions 1 and 2, logs in drive A: and returns 0FFh if there is a file present whose name begins with a $, otherwise 0. Replacement BDOSses may modify this behaviour.
- * In multitasking versions, returns 0 if succeeded, or 0FFh if other processes have files open on removable or read-only drives. 
+ * In multitasking versions, returns 0 if succeeded, or 0FFh if other processes have files open on removable or read-only drives.
  */
 	void resetDiskSystem(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
 #if LOG
 		std::clog << "Reset drive ; default to A" << std::endl;
 #endif
-		memory[USER_DRIVE] = 0x00;	// USER: 0, DRIVE: 0 (A)
-		dma = 0x80;
+		memory[USER_DRIVE] &= 0xF0;	// DRIVE: 0 (A), user unchanged
+		dma = DEFAULT_DMA;
+	// 0FFh if a file name begins with '$' (the CCP then looks for $$$.SUB)
+		std::error_code ec;
+		for (const auto& entry : std::filesystem::directory_iterator(drivePath(0), ec)) {
+			if (entry.path().filename().string()[0] == '$') {
+				returnCode(cpu, 0xFF);
+				return;
+			}
+		}
 		returnCode(cpu, 0);
 	}
-		
+
 /**
  * BDOS function 14 (DRV_SET) - Select disc
  * Supported by: All versions
  * Entered with C=0Eh, E=drive number. Returns L=A=0 or 0FFh.
  * The drive number passed to this routine is 0 for A:, 1 for B: up to 15 for P:.
- * Sets the currently selected drive to the drive in A; logs in the disc. Returns 0 if successful or 0FFh if error. Under MP/M II and later versions, H can contain a physical error number. 
+ * Sets the currently selected drive to the drive in A; logs in the disc. Returns 0 if successful or 0FFh if error. Under MP/M II and later versions, H can contain a physical error number.
  */
  	void selectDisk(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
@@ -392,10 +478,8 @@ protected:
 			returnCode(cpu, 0xFF);
 			return;
 		}
-		
-		const char dir[] = { char('A' + Z80_E(cpu)), '\0' };
-		const std::filesystem::path path(dir);
-		if (std::filesystem::exists(path)) {
+
+		if (std::filesystem::is_directory(drivePath(Z80_E(cpu)))) {
 			memory[USER_DRIVE] = (memory[USER_DRIVE] & 0xF0) | (Z80_E(cpu) & 0x0F);
 			returnCode(cpu, 0x00);
 			return;
@@ -403,7 +487,7 @@ protected:
 		std::cerr << ">> Path '" << char('A' + Z80_E(cpu)) << "/' do not exists!" << std::endl;
 		returnCode(cpu, 0xFF);
 	}
-	
+
 /**
  * BDOS function 15 (F_OPEN) - Open file
  * Supported by: All versions
@@ -420,31 +504,27 @@ protected:
  *  * F7' is set if the file is read-only because writing is password protected and no password was supplied;
  *  * F8' is set if the file is read-only because it is a User 0 system file opened from another user area.
  */
-	void openFile(Z80& cpu, const uint8_t memory[]) {
+	void openFile(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
-		const FCB_t *const pFCB = reinterpret_cast<const FCB_t *const>(memory + Z80_DE(cpu));
-		char filename[15];	// DIR + "/" + NAME + "." + EXT
-		fcbToFilename(pFCB, (memory[USER_DRIVE] & 0x0F), filename);
+		FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
+		const auto path = hostPath(pFCB, memory);
 
 #if LOG
-		std::clog << "Open file " << '"' << filename << "\" (FCB: "
+		std::clog << "Open file " << path << " (FCB: "
 				  << std::hex << unsigned(Z80_DE(cpu)) << "h) "
 				  << std::endl;
 #endif
 
-		std::fstream& s = getStream(Z80_DE(cpu));
-		s.close();	// in case of...
-		s.open(filename, std::ios::binary|std::ios::in);	// Open RO !
-		if (!s) {
-#if LOG
-			std::cerr << ">> Error opening file '" << filename << "': "
-					  << strerror(errno) << "!" << std::endl;
-#endif
+		std::error_code ec;
+		OpenFile *const pFile = std::filesystem::is_regular_file(path, ec)
+			? openStream(Z80_DE(cpu), pFCB, memory, path)
+			: nullptr;
+		if (!pFile) {
+			if (auto *const p = findStream(Z80_DE(cpu))) release(*p);
 			returnCode(cpu, 0xFF);
-			releaseStream(Z80_DE(cpu));
 			return;
 		}
-//		memcpy(pFCB->AL, &ps, sizeof(ps));
+		pFCB->RC = extentRecords(*pFile, fcbRecord(pFCB));
 		returnCode(cpu, 0x00);
 	}
 
@@ -459,24 +539,27 @@ protected:
  */
  	void closeFile(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
-//		FCB_t *const pFCB = reinterpret_cast<FCB_t *const>(memory + state.Z_Z80_STATE_MEMBER_DE);
 #if LOG
 		std::clog << "Close file (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
 #endif
-/*
-		std::fstream* ps;
-		memcpy(&ps, pFCB->AL, sizeof(ps));
-*/
-		std::fstream& s = getStream(Z80_DE(cpu));
-		s.close();
-		if (s.is_open()) {
-			std::cerr << ">> Error closing file: " << strerror(errno) << "!" << std::endl;
+		const FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
+		const auto path = hostPath(pFCB, memory);
+		if (auto *const pFile = findStream(Z80_DE(cpu))) release(*pFile);
+		std::error_code ec;
+		if (!std::filesystem::is_regular_file(path, ec)) {
 			returnCode(cpu, 0xFF);	// KO
-		} else {
-			releaseStream(Z80_DE(cpu));
-			returnCode(cpu, 0x00);	// OK
+			return;
 		}
+	// Closing writes RC to the directory: a lower RC in the last extent
+	// truncates the file (the CCP does so to consume $$$.SUB).
+		const uint32_t records = (std::filesystem::file_size(path, ec) + SECTOR_SIZE - 1) / SECTOR_SIZE;
+		const uint32_t first = fcbRecord(pFCB) - fcbRecord(pFCB) % RECORDS_PER_EXTENT;
+		if (!ec && records > first && records <= first + RECORDS_PER_EXTENT && pFCB->RC < records - first) {
+			std::filesystem::resize_file(path, uintmax_t(first + pFCB->RC) * SECTOR_SIZE, ec);
+		}
+		returnCode(cpu, ec ? 0xFF : 0x00);
 	}
+
 /**
  * BDOS function 17 (F_SFIRST) - search for first
  * Supported by: All versions
@@ -484,36 +567,51 @@ protected:
  * Search for the first occurrence of the specified file; the filename should be stored in the supplied FCB. The filename can include ? marks, which match anything on disc. If the first byte of the FCB is ?, then any directory entry (including disc labels, date stamps etc.) will match. The EX byte is also checked; normally it should be set to zero, but if it is set to ? then all suitable extents are matched.
  * Returns A=0FFh if error (CP/M 3 returns a hardware error in H and B), or A=0-3 if successful. The value returned can be used to calculate the address of a memory image of the directory entry; it is to be found at DMA+A*32.
  * Under CP/M-86 v4, if the first byte of the FCB is '?' or bit 7 of the byte is set, subdirectories as well as files will be returned by this search.
+ * The host directory is read once here; entries are then returned in name order.
  */
 	void searchForFirst(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
-		const FCB_t *const pFCB = reinterpret_cast<const FCB_t *const>(memory + Z80_DE(cpu));
+		const FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
 #if LOG
 		std::clog << "Search for first (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
 #endif
-		const char dir[] = { char('A' + (pFCB->DR ? pFCB->DR-1 : (memory[USER_DRIVE] & 0x0F))), '/', '\0' };
+		char filter[11];
+		fcbName(pFCB, filter);
+		if (pFCB->DR == '?') memset(filter, '?', sizeof(filter));
+		const bool allExtents = pFCB->DR == '?' || pFCB->EX == '?';
+		const uint32_t wanted = (pFCB->S2 & 0x7F) * EXTENTS_PER_MODULE + (pFCB->EX & 0x1F);
 
-		memcpy(filter, pFCB->filename, 11);
-		filter[11] = '\0';
-		const std::filesystem::path path(dir);
+		found.clear();
+		nextFound = 0;
+		const auto path = drivePath(fcbDrive(pFCB, memory));
 		std::error_code ec;
-		di = std::filesystem::directory_iterator(path, ec);		// New directory_iterator
+		std::filesystem::directory_iterator di(path, ec);
 		if (ec) {
 			std::cerr << ">> Error looking for path '" << path.string() << "': " << ec.message() << "!" << std::endl;
 			returnCode(cpu, 0xFF);	// KO
 			return;
 		}
-
-		char filename[12];
-		if (findFile(di, filter, filename)) {	// first find
-			++di;	// go to next
-			memory[dma] = pFCB->DR;
-			memcpy(memory + dma + 1, filename, 11);
-			returnCode(cpu, 0x00);	// OK
-		} else {	// cant find any
-			returnCode(cpu, 0xFF);	// KO
+		for (const auto& entry : di) {
+			Entry e;
+			if (entry.is_regular_file(ec) &&
+				filenameDOS2CPM(entry.path().filename().string().c_str(), e.name) &&
+				matches(filter, e.name)) {
+			// One directory entry by 16K extent: all of them if EX is '?', else the one asked
+				const uint32_t records = (entry.file_size(ec) + SECTOR_SIZE - 1) / SECTOR_SIZE;
+				const uint32_t extents = records ? (records + RECORDS_PER_EXTENT - 1) / RECORDS_PER_EXTENT : 1;
+				for (e.extent = 0; e.extent < extents; ++e.extent) {
+					if (allExtents || e.extent == wanted) {
+						e.records = std::min(records - e.extent * RECORDS_PER_EXTENT, RECORDS_PER_EXTENT);
+						found.push_back(e);
+					}
+				}
+			}
 		}
-		return;
+		std::sort(found.begin(), found.end(), [](const Entry& a, const Entry& b) {
+			const auto c = memcmp(a.name, b.name, sizeof(a.name));
+			return c ? c < 0 : a.extent < b.extent;
+		});
+		searchForNext(cpu, memory);
 	}
 
 /**
@@ -523,62 +621,77 @@ protected:
  * This function should only be executed immediately after function 17 or another invocation of function 18. No other disc access functions should have been used.
  * Function 18 behaves exactly as number 17, but finds the next occurrence of the specified file after the one returned last time. The FCB parameter is not documented, but Jim Lopushinsky states in LD301.DOC:
  * In none of the official Programmer's Guides for any version of CP/M does it say that an FCB is required for Search Next (function 18). However, if the FCB passed to Search First contains an unambiguous file reference (i.e. no question marks), then the Search Next function requires an FCB passed in reg DE (for CP/M-80) or DX (for CP/M-86).
+ * The directory entry of the file extent is built at DMA.
  */
 	void searchForNext(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
-		FCB_t *const pFCB = reinterpret_cast<FCB_t *const>(memory + Z80_DE(cpu));
 #if LOG
 		std::clog << "Search for next (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
 #endif
-
-		char filename[12];
-		if (findFile(di, filter, filename)) {
-			++di;
-			memory[dma] = pFCB->DR;
-			memcpy(memory + dma + 1, filename, 11);
-			returnCode(cpu, 0x00);	// OK
-		} else {
+		if (nextFound >= found.size() || !dmaFits(DIR_ENTRY_SIZE)) {
 			returnCode(cpu, 0xFF);	// KO
+			return;
 		}
+		const Entry& e = found[nextFound++];
+		const auto rc = e.records;
+
+		uint8_t *const entry = memory + dma;
+		memset(entry, 0, DIR_ENTRY_SIZE);
+		entry[0] = memory[USER_DRIVE] >> 4;			// User number
+		memcpy(entry + 1, e.name, sizeof(e.name));
+		entry[12] = e.extent % EXTENTS_PER_MODULE;	// EX
+		entry[14] = e.extent / EXTENTS_PER_MODULE;	// S2
+		entry[15] = rc;								// RC
+		for (auto b = 0U; b < (rc + RECORDS_PER_BLOCK - 1U) / RECORDS_PER_BLOCK; ++b) {
+			entry[16 + 2 * b] = 1;					// Fake allocated blocks
+		}
+		returnCode(cpu, 0x00);	// OK
 	}
 
 /**
- * BDOS function 19
+ * BDOS function 19 (F_DELETE) - delete file
+ * Supported by: All versions
+ * Entered with C=13h, DE=address of FCB. Returns error codes in BA and HL.
+ * Deletes all directory entries matching the specified filename. The name can contain ? marks.
+ * Returns A=0FFh if error, otherwise 0-3.
  */
  	void deleteFile(Z80& cpu, uint8_t *const memory) {
-		FCB_t *const pFCB = reinterpret_cast<FCB_t *const>(memory + Z80_DE(cpu));
+		const FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
 #if LOG
 		std::clog << "Delete file (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
 #endif
-		const char dir[] = { char('A' + (pFCB->DR ? pFCB->DR-1 : (memory[USER_DRIVE]) & 0x0F)), '/', '\0' };
+		char filter[11];
+		fcbName(pFCB, filter);
 
-		char filter[12];
-		memcpy(filter, pFCB->filename, 11);
-		filter[11] = '\0';
-		
-		const std::filesystem::path path(dir);
+		const auto path = drivePath(fcbDrive(pFCB, memory));
 		std::error_code ec;
 		std::filesystem::directory_iterator di(path, ec);		// New directory_iterator
 		if (ec) {
 			std::cerr << ">> Error looking for path '" << path.string() << "': " << ec.message() << "!" << std::endl;
 			returnCode(cpu, 0xFF);	// KO
 			return;
-		}		
+		}
 
-		char cpm[12];
-		unsigned nb = 0;
-		while (findFile(di, filter, cpm)) {
-			std::filesystem::remove(di->path(), ec);
-			if (ec) {
-				std::cerr << ">> Error removing '" << di->path().string() << "': " << ec.message() << "!" << std::endl;
-				returnCode(cpu, 0xFF);	// KO
-				return;
-			} else {
-				++nb;
-				++di;
+	// Collect first, so that the directory is not changed while scanning it
+		std::vector<std::filesystem::path> victims;
+		for (const auto& entry : di) {
+			char name[11];
+			if (entry.is_regular_file(ec) &&
+				filenameDOS2CPM(entry.path().filename().string().c_str(), name) &&
+				matches(filter, name)) {
+				victims.push_back(entry.path());
 			}
 		}
-		returnCode(cpu, nb ? 0x00 : 0xFF);	// one or more file removed
+		for (const auto& victim : victims) {
+			releasePath(victim);
+			std::filesystem::remove(victim, ec);
+			if (ec) {
+				std::cerr << ">> Error removing '" << victim.string() << "': " << ec.message() << "!" << std::endl;
+				returnCode(cpu, 0xFF);	// KO
+				return;
+			}
+		}
+		returnCode(cpu, victims.empty() ? 0xFF : 0x00);	// one or more file removed
 	}
 
 /**
@@ -593,71 +706,59 @@ protected:
  *  11 (MP/M) unlocked file verification error,
  *  0FFh hardware error.
  * If on return A is not 0FFh, H contains the number of 128-byte records read before the error (MP/M II and later).
+ * The record read is the one given by S2, EX & CR in the FCB.
  */
  	void readSequential(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
-//		FCB_t *const pFCB = reinterpret_cast<FCB_t *const>(memory + Z80_DE(cpu));
+		FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
 #if LOG
 		std::clog << "Read next record (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
 #endif
-		if (dma + SECTOR_SIZE >= MEMORY_SIZE * 1024) {
+		if (!dmaFits(SECTOR_SIZE)) {
 			std::cerr << ">> Writing DMA out of memory!" << std::endl;
-			returnCode(cpu, 0xFF);	// OK
+			returnCode(cpu, 0xFF);
 			return;
 		}
-		std::fstream& s = getStream(Z80_DE(cpu));
-		s.read(reinterpret_cast<char*>(memory + dma), SECTOR_SIZE);
-		if (s) {
-			returnCode(cpu, 0x00);	// OK
-		} else {
-			if (s.eof()) {
-				if (s.gcount()) {		// few read
-					memset(memory + s.gcount(), 0xE5, SECTOR_SIZE - s.gcount());	// padding with 0xE5
-					returnCode(cpu, 0x00);	// OK - May be partial read
-				} else {
-					returnCode(cpu, 0x01);	// EOF - Nothing read
-				} 
-			} else {
-				std::cerr << ">> Error reading: " << strerror(errno) << "!" << std::endl;
-				
-				std::cerr << ">> " << s.gcount() << " bytes read" << std::endl;
-				std::cerr << ">> good: " << s.good() << std::endl;
-				std::cerr << ">> fail: " << s.fail() << std::endl;
-				std::cerr << ">> bad: " << s.bad() << std::endl;
-				std::cerr << ">> eof: " << s.eof() << std::endl;
-				returnCode(cpu, 0xFF);	// OK
-			}
+		OpenFile *const pFile = stream(Z80_DE(cpu), pFCB, memory);
+		if (!pFile) {
+			returnCode(cpu, 0x01);	// EOF - No such file
+			return;
 		}
+		const auto record = fcbRecord(pFCB);
+		const auto result = readRecord(*pFile, record, memory + dma);
+		if (!result) setFcbRecord(pFCB, record + 1, *pFile);
+		returnCode(cpu, result);
 	}
 
 /**
- * BDOS function 21
+ * BDOS function 21 (F_WRITE) - write next record
+ * Supported by: All versions
+ * Entered with C=15h, DE=address of FCB. Returns error codes in BA and HL.
+ * Write a record (normally 128 bytes) from the DMA address to the file, at the position given by S2, EX & CR in the FCB.
+ * Returns A=0 if OK, 1 if directory full, 2 if disc full, 0FFh if hardware error.
  */
 	void writeSequential(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
-//		FCB_t *const pFCB = reinterpret_cast<FCB_t *const>(memory + Z80_DE(cpu));
+		FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
 #if LOG
 		std::clog << "Write next record (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
 #endif
-		if (dma + SECTOR_SIZE >= MEMORY_SIZE * 1024) {
+		if (!dmaFits(SECTOR_SIZE)) {
 			std::cerr << ">> Reading DMA out of memory!" << std::endl;
 			returnCode(cpu, 0xFF);	// KO
 			return;
 		}
-		std::fstream& s = getStream(Z80_DE(cpu));
-		s.write(reinterpret_cast<char*>(memory + dma), SECTOR_SIZE);
-		if (!s) {
-			std::cerr << ">> Error writing: " << strerror(errno) << "!" << std::endl;
-			std::cerr << ">> good: " << s.good() << std::endl;
-			std::cerr << ">> fail: " << s.fail() << std::endl;
-			std::cerr << ">> bad: " << s.bad() << std::endl;
-			std::cerr << ">> eof: " << s.eof() << std::endl;
-			returnCode(cpu, 0xFF);	// KO
+		OpenFile *const pFile = stream(Z80_DE(cpu), pFCB, memory);
+		if (!pFile) {
+			returnCode(cpu, 0xFF);	// KO - No such file
 			return;
 		}
-		returnCode(cpu, 0x00);	// OK
+		const auto record = fcbRecord(pFCB);
+		const auto result = writeRecord(*pFile, record, memory + dma);
+		if (!result) setFcbRecord(pFCB, record + 1, *pFile);
+		returnCode(cpu, result);
 	}
-	
+
 /**
  * BDOS function 22 (F_MAKE) - create file
  * Supported by: All versions
@@ -668,34 +769,23 @@ protected:
  * Under MP/M II and later versions, set F6' to create the file with a password; the DMA address should point at a 9-byte buffer:
  *  DEFS    8   ; Password
  *  DEFB    1   ; Password mode
- */ 
+ * CP/M 2.2 would make a second directory entry for an existing file; here it is emptied.
+ */
 	void makeFile(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
-		FCB_t *const pFCB = reinterpret_cast<FCB_t *const>(memory + Z80_DE(cpu));
+		FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
+		const auto path = hostPath(pFCB, memory);
 #if LOG
-		std::clog << "Make file (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
+		std::clog << "Make file " << path << " (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
 #endif
-		char filename[15];	// DIR + "/" + NAME + "." + EXT
-		fcbToFilename(pFCB, (memory[USER_DRIVE] & 0x0F), filename);
-		
-		auto sIn = std::ifstream(filename, std::ios_base::in);
-		if (sIn.is_open()) {	// Existing file (error!)
-			sIn.close();
-			std::cerr << ">> Error creating file '" << filename << "': Already existing file!" << std::endl;
+		releasePath(path);
+		if (!openStream(Z80_DE(cpu), pFCB, memory, path, std::ios::trunc)) {
+			std::cerr << ">> Error creating file '" << path.string() << "': " << strerror(errno) << "!" << std::endl;
 			returnCode(cpu, 0xFF);
-		} else {			// New file (find.)
-			std::fstream& sOut = getStream(Z80_DE(cpu));
-			sOut.close();	// in case of...
-			sOut.open(filename, std::ios::binary|std::ios::out|std::ios::in|std::ios::trunc);	// create if not exists
-			if (!sOut) {	// fail to open!
-				std::cerr << ">> Error opening file '" << filename << "': " << strerror(errno) << "!" << std::endl;
-				returnCode(cpu, 0xFF);
-				releaseStream(Z80_DE(cpu));
-			} else {	// Success opening.
-//				memcpy(pFCB->AL, &ps, sizeof(ps));
-				returnCode(cpu, 0x00);
-			}
+			return;
 		}
+		pFCB->RC = 0;
+		returnCode(cpu, 0x00);
 	}
 
 /**
@@ -704,51 +794,51 @@ protected:
  * Entered with C=17h, DE=address of FCB. Returns error codes in BA and HL.
  * Renames the file specified to the new name, stored at FCB+16. This function cannot rename across drives so the "drive" bytes of both filenames should be identical. Returns A=0-3 if successful; A=0FFh if error. Under CP/M 3, if H is zero then the file could not be found; if it is nonzero it contains a hardware error number.
  * Under Concurrent CP/M, set F5' if an extended lock on the file should be held through the rename. Otherwise the lock will be released.
- */ 
+ */
  	void renameFile(Z80& cpu, uint8_t memory[]) {
 		assert(memory);
-		FCB_t *const pFCB1 = reinterpret_cast<FCB_t *const>(memory + Z80_DE(cpu));
-		FCB_t *const pFCB2 = reinterpret_cast<FCB_t *const>(memory + Z80_DE(cpu) + 16);
+		const FCB_t *const pFCB1 = fcbAt(memory, Z80_DE(cpu));
+		const FCB_t *const pFCB2 = fcbAt(memory, Z80_DE(cpu) + 16);
+		const auto drive = fcbDrive(pFCB1, memory);
+		char name1[11], name2[11];
+		fcbName(pFCB1, name1);
+		fcbName(pFCB2, name2);
+		const auto from = hostPath(drive, name1);
+		const auto to = hostPath(drive, name2);
 #if LOG
-		std::clog << "Rename file (FCB1: " << std::hex << unsigned(Z80_DE(cpu)) << "h) (FCB2: " << std::hex << unsigned(Z80_DE(cpu) + 16) << "h) " << std::endl;
+		std::clog << "Rename file " << from << " to " << to << std::endl;
 #endif
-		char filename1[15];	// DIR + "/" + NAME + "." + EXT
-		fcbToFilename(pFCB1, (memory[USER_DRIVE] & 0x0F), filename1);
-		char filename2[15];	// DIR + "/" + NAME + "." + EXT
-		fcbToFilename(pFCB2, (memory[USER_DRIVE] & 0x0F), filename2);
-#if LOG
-		std::clog << "old filename " << filename1;
-		std::clog << "new filename " << filename2;
-#endif
-
-		if (std::rename(filename1, filename2))
-		{
-			std::perror("Error renaming");
+		std::error_code ec;
+		if (!std::filesystem::is_regular_file(from, ec) || std::filesystem::exists(to, ec)) {
 			returnCode(cpu, 0xFF);
+			return;
+		}
+		releasePath(from);
+		std::filesystem::rename(from, to, ec);
+		if (ec) {
+			std::cerr << ">> Error renaming '" << from.string() << "': " << ec.message() << "!" << std::endl;
+			returnCode(cpu, 0xFF);
+			return;
 		}
 		returnCode(cpu, 0x00);
-
 	}
- 	
+
 /**
  * BDOS function 24 (DRV_LOGINVEC) - Return bitmap of logged-in drives
  * Supported by: All versions
  * Entered with C=18h. Returns bitmap in HL.
  * Bit 7 of H corresponds to P: while bit 0 of L corresponds to A:. A bit is set if the corresponding drive is logged in.
  * In DOSPLUS v2.1, the three top bits (for the floating drives) will mirror the status of the corresponding host drives). This does not happen in earlier DOSPLUS / Personal CP/M-86 systems.
- */ 
- 
+ */
  	void returnLogicVector(Z80& cpu) {
 #if LOG
 		std::clog << "Return Logic Vector (actives disks)" << std::endl;
 #endif
 		uint16_t actives = 0;
 		for (auto d = 0; d <= 15; ++d) {
-			const char dir[] = { char('A' + d), '\0' };
-			const std::filesystem::path path(dir);
-			const auto status = std::filesystem::status(path);
-			if (exists(status) && is_directory(status)) actives |= (1 << d);
-		}		
+			std::error_code ec;
+			if (std::filesystem::is_directory(drivePath(d), ec)) actives |= (1 << d);
+		}
 		returnCode(cpu, actives);
 	}
 
@@ -778,7 +868,7 @@ protected:
 		dma = Z80_DE(cpu);
 		returnCode(cpu, 0);	// OK
 	}
-		
+
 /**
  * BDOS function 27 (DRV_ALLOCVEC) - Return address of allocation map
  * Supported by: All versions, but differs in banked versions.
@@ -786,8 +876,11 @@ protected:
  * Return the address of the allocation bitmap (which blocks are used and which are free) in HL. Under banked CP/M 3 and MP/M, this will be an address in bank 0 (the system bank) and not easily accessible.
  * Under previous versions, the format of the bitmap is a sequence of bytes, with bit 7 of the byte representing the lowest-numbered block on disc, and counting starting at block 0 (the directory). A bit is set if the corresponding block is in use.
  * Under CP/M 3, the allocation vector may be of this form (single-bit) or allocate two bits to each block (double-bit). This information is stored in the SCB.
+ * The emulated disks always look empty.
  */
-	void getAddrAlloc(Z80& cpu, uint8_t *const memory);
+	void getAddrAlloc(Z80& cpu) {
+		returnCode(cpu, ALV_ADDR);
+	}
 
 /**
  * BDOS function 28 (DRV_SETRO) - Software write-protect current disc
@@ -795,31 +888,24 @@ protected:
  * Entered with C=1Ch.
  * Temporarily set current drive to be read-only; attempts to write to it will fail. Under genuine CP/M systems, this continues until either call 13 (disc reset) or call 37 (selective disc reset) is called; in practice, this means that whenever a program returns to the command prompt, all drives are reset to read/write. Newer BDOS replacements only reset the drive when function 37 is called.
  * Under multitasking CP/Ms, this can fail (returning A=0FFh) if another process has a file open on the drive.
+ * Not emulated: accepted and ignored.
  */
-	void writeProtectDisk(Z80& cpu, uint8_t *const memory);
+	void writeProtectDisk(Z80& cpu) {
+		returnCode(cpu, 0);
+	}
 
 /**
  * BDOS function 29 (DRV_ROVEC) - Return bitmap of read-only drives
  * Supported by: All versions
  * Entered with C=1Dh. Returns bitmap in HL.
  * Bit 7 of H corresponds to P: while bit 0 of L corresponds to A:. A bit is set if the corresponding drive is set to read-only in software.
+ * Emulated drives are never read-only.
  */
 	void getROVector(Z80& cpu) {
 #if LOG
 		std::clog << "Return RO Vector (read-only disks)" << std::endl;
 #endif
-		uint16_t ro = 0;
-		for (auto d = 0; d <= 15; ++d) {
-			const char dir[] = { char('A' + d), '\0' };
-			const std::filesystem::path path(dir);
-			const auto status = std::filesystem::status(path);
-//			const auto perms = status.permissions();
-			if (exists(status) && is_directory(status)) ro |= (0 << d);
-
-/* TODO (#1#): Terminer cette fonction avec la 
-               détection du readonly */
-		}
-		returnCode(cpu, ro);
+		returnCode(cpu, 0);
 	}
 
 /**
@@ -830,17 +916,25 @@ protected:
  * Under Concurrent CP/M, if the F5' bit is not set and the file has an extended file lock, the lock will be released when the attributes are set. If F5' is set the lock stays.
  * Under CP/M 3, the Last Record Byte Count is set by storing the required value at FCB+32 (FCB+20h) and setting the F6' bit.
  * The code returned in A is 0-3 if the operation was successful, or 0FFh if there was an error. Under CP/M 3, if A is 0FFh and H is nonzero, H contains a hardware error.
+ * Attributes are not stored: only checks that the file exists.
  */
-	void setFileAttributes(Z80& cpu, uint8_t *const memory);
+	void setFileAttributes(Z80& cpu, const uint8_t memory[]) {
+		std::error_code ec;
+		const bool ok = std::filesystem::is_regular_file(hostPath(fcbAt(memory, Z80_DE(cpu)), memory), ec);
+		returnCode(cpu, ok ? 0x00 : 0xFF);
+	}
 
 /**
  * BDOS function 31 (DRV_DPB) - get DPB address
  * Supported by: CP/M 2 and later.
  * Entered with C=1Fh. Returns address in HL.
  * Returns the address of the Disc Parameter Block for the current drive. See the formats listing for details of the DPBs under various CP/M versions.
+ * All drives share the same DPB.
  */
-	void getAddrDiskParms(Z80& cpu, uint8_t *const memory);
-	
+	void getAddrDiskParms(Z80& cpu) {
+		returnCode(cpu, DPB_ADDR);
+	}
+
 /**
  * BDOS function 32 (F_USERNUM) - get/set user number
  * Supported by: CP/M 2 and later.
@@ -859,20 +953,20 @@ protected:
 #if LOG
 			std::clog << "Set user number to " << unsigned(Z80_E(cpu)) << std::endl;
 #endif
-			memory[USER_DRIVE] = (memory[USER_DRIVE] & 0x0F) | Z80_E(cpu) << 4;
+			memory[USER_DRIVE] = (memory[USER_DRIVE] & 0x0F) | (Z80_E(cpu) << 4);
 			returnCode(cpu, 0);	// OK
 		}
 	}
 
 /**
- * BDOS function 33
- * 
+ * BDOS function 33 (F_READRAND) - Random access read record
+ * Supported by: CP/M 2 and later.
  * Entered with C=21h, DE=FCB address. Returns error codes in BA and HL.
  *
- * Read the record specified in the random record count area of the FCB, at the DMA address. 
- * The pointers in the FCB will be updated so that the next record to read using the sequential I/O 
+ * Read the record specified in the random record count area of the FCB, at the DMA address.
+ * The pointers in the FCB will be updated so that the next record to read using the sequential I/O
  * calls will be the record just read. Error numbers returned are:
- * 
+ *
  * 0 OK
  * 1 Reading unwritten data
  * 4 Reading unwritten extent (a 16k portion of file does not exist)
@@ -880,134 +974,294 @@ protected:
  * 9 Invalid FCB
  * 10 Media changed (CP/M); FCB checksum error (MP/M),
  * 11 Unlocked file verification error (MP/M), 0FFh
- * 
+ *
  */
 	void readRandom(Z80& cpu, uint8_t *const memory) {
 		assert(memory);
-		FCB_t *const pFCB = reinterpret_cast<FCB_t *const>(memory + Z80_DE(cpu));
-		uint32_t r = pFCB->R[0] + (pFCB->R[1] << 8) + (pFCB->R[2] << 16);
+		FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
+		const uint32_t record = randomRecord(pFCB);
 #if LOG
-		std::clog << "R[0]" << std::hex << unsigned(pFCB->R[0]) << std::endl;
-		std::clog << "R[1]" << std::hex << unsigned(pFCB->R[1]) << std::endl;
-		std::clog << "R[2]" << std::hex << unsigned(pFCB->R[2]) << std::endl;
-		std::clog << "Read random record " << std::hex << r << "h (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
-
+		std::clog << "Read random record " << std::hex << record << "h (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
 #endif
-		if (dma + SECTOR_SIZE >= MEMORY_SIZE * 1024) {
-			std::cerr << ">> Writing DMA out of memory!" << std::endl;
-			returnCode(cpu, 0xFF);	// OK
+		if (pFCB->R[2]) {
+			returnCode(cpu, 0x06);	// Out of range
 			return;
 		}
-		std::fstream& s = getStream(Z80_DE(cpu));
-		s.seekg(r * SECTOR_SIZE);
-		s.read(reinterpret_cast<char*>(memory + dma), SECTOR_SIZE);
-		if (s) {
-			returnCode(cpu, 0x00);	// OK
-		} else {
-			if (s.eof()) {
-				if (s.gcount()) {		// few read
-					memset(memory + s.gcount(), 0xE5, SECTOR_SIZE - s.gcount());	// padding with 0xE5
-					returnCode(cpu, 0x00);	// OK - May be partial read
-				} else {
-					returnCode(cpu, 0x01);	// EOF - Nothing read
-				} 
-			} else {
-				std::cerr << ">> Error reading: " << strerror(errno) << "!" << std::endl;
-				
-				std::cerr << ">> " << s.gcount() << " bytes read" << std::endl;
-				std::cerr << ">> good: " << s.good() << std::endl;
-				std::cerr << ">> fail: " << s.fail() << std::endl;
-				std::cerr << ">> bad: " << s.bad() << std::endl;
-				std::cerr << ">> eof: " << s.eof() << std::endl;
-				returnCode(cpu, 0xFF);
-			}
+		if (!dmaFits(SECTOR_SIZE)) {
+			std::cerr << ">> Writing DMA out of memory!" << std::endl;
+			returnCode(cpu, 0xFF);
+			return;
 		}
+		OpenFile *const pFile = stream(Z80_DE(cpu), pFCB, memory);
+		if (!pFile) {
+			returnCode(cpu, 0x01);	// Reading unwritten data - No such file
+			return;
+		}
+		const auto result = readRecord(*pFile, record, memory + dma);
+		if (!result) setFcbRecord(pFCB, record, *pFile);
+		returnCode(cpu, result);
 	}
 
 /**
- * BDOS function 34
+ * BDOS function 34 (F_WRITERAND) - Random access write record
+ * Supported by: CP/M 2 and later.
+ * Entered with C=22h, DE=FCB address. Returns error codes in BA and HL.
+ * Write the record specified in the random record count area of the FCB, from the DMA address.
+ * The pointers in the FCB will be updated so that the next record to write using the sequential I/O
+ * calls will be the record just written.
  */
-	void writeRandom(Z80& cpu, uint8_t *const memory);
+	void writeRandom(Z80& cpu, uint8_t *const memory) {
+		assert(memory);
+		FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
+		const uint32_t record = randomRecord(pFCB);
+#if LOG
+		std::clog << "Write random record " << std::hex << record << "h (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
+#endif
+		if (pFCB->R[2]) {
+			returnCode(cpu, 0x06);	// Out of range
+			return;
+		}
+		if (!dmaFits(SECTOR_SIZE)) {
+			std::cerr << ">> Reading DMA out of memory!" << std::endl;
+			returnCode(cpu, 0xFF);
+			return;
+		}
+		OpenFile *const pFile = stream(Z80_DE(cpu), pFCB, memory);
+		if (!pFile) {
+			returnCode(cpu, 0xFF);	// KO - No such file
+			return;
+		}
+		const auto result = writeRecord(*pFile, record, memory + dma);
+		if (!result) setFcbRecord(pFCB, record, *pFile);
+		returnCode(cpu, result);
+	}
 
 /**
- * BDOS function 35
+ * BDOS function 35 (F_SIZE) - Compute file size
+ * Supported by: CP/M 2 and later.
+ * Entered with C=23h, DE=FCB address. Returns error codes in BA and HL.
+ * Set the random record count bytes of the FCB to the number of 128-byte records in the file.
  */
-	void computeFileSize(Z80& cpu, uint8_t *const memory);
+	void computeFileSize(Z80& cpu, uint8_t *const memory) {
+		assert(memory);
+		FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
+		std::error_code ec;
+		const auto size = std::filesystem::file_size(hostPath(pFCB, memory), ec);
+		if (ec) {
+			returnCode(cpu, 0xFF);
+			return;
+		}
+		setRandomRecord(pFCB, (size + SECTOR_SIZE - 1) / SECTOR_SIZE);
+		returnCode(cpu, 0x00);
+	}
 
 /**
- * BDOS function 36
+ * BDOS function 36 (F_RANDREC) - Update random access pointer
+ * Supported by: CP/M 2 and later.
+ * Entered with C=24h, DE=FCB address. Returns error codes in BA and HL.
+ * Set the random record count bytes of the FCB to the number of the last record read/written by the sequential I/O calls.
  */
 	void setRandomRecord(Z80& cpu, uint8_t *const memory)  {
 		assert(memory);
-		FCB_t *const pFCB = reinterpret_cast<FCB_t *const>(memory + Z80_DE(cpu));
-		std::fstream& s = getStream(Z80_DE(cpu));
-		uint32_t p = s.tellg() / SECTOR_SIZE;
+		FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
+		setRandomRecord(pFCB, fcbRecord(pFCB));
+		returnCode(cpu, 0x00);	// OK
+	}
 
-		if (s) {
-			pFCB->R[0] = p & 0xff;
-			pFCB->R[1] = (p >> 8) & 0xff;
-			pFCB->R[2] = (p >> 16) & 0xff;
-			returnCode(cpu, 0x00);	// OK
-		} else {
-			std::cerr << ">> Error reading: " << strerror(errno) << "!" << std::endl;
-			
-			std::cerr << ">> " << s.gcount() << " bytes read" << std::endl;
-			std::cerr << ">> good: " << s.good() << std::endl;
-			std::cerr << ">> fail: " << s.fail() << std::endl;
-			std::cerr << ">> bad: " << s.bad() << std::endl;
-			std::cerr << ">> eof: " << s.eof() << std::endl;
-			returnCode(cpu, 0xFF);
+/**
+ * BDOS function 37 (DRV_RESET) - Selectively reset disc drives
+ * Supported by: CP/M 2 and later.
+ * Entered with C=25h, DE=bitmap of drives to reset. Returns A=0 if OK.
+ */
+	void resetDrive(Z80& cpu) {
+		returnCode(cpu, 0x00);
+	}
+
+/**
+ * BDOS function 40 (F_WRITEZF) - Write random with zero fill
+ * Supported by: CP/M 2 and later.
+ * Entered with C=28h, DE=FCB address. Returns error codes in BA and HL.
+ * As function 34, but if the write is to a newly allocated disc block the remainder of the block is filled with zeroes.
+ * Host files have no blocks; a write past the end of file fills the gap with zeroes.
+ */
+	void writeRandomWithZeroFill(Z80& cpu, uint8_t *const memory) {
+		writeRandom(cpu, memory);
+	}
+
+
+/**
+ * An host file opened through a FCB.
+ */
+	struct OpenFile {
+		uint16_t fcb = 0;			// FCB address, 0 if free
+		unsigned drive = 0;			// Drive & name the FCB had when opened
+		char name[11];
+		std::filesystem::path path;
+		std::fstream stream;
+		unsigned long used = 0;		// Last use, for recycling
+	};
+
+/**
+ * A file found by searchForFirst.
+ */
+	struct Entry {
+		char name[11];
+		uint32_t extent = 0;		// Extent number (S2 * 32 + EX)
+		uint8_t records = 0;		// Records in this extent (RC)
+	};
+
+/**
+ * Return the stream already opened for this FCB address, if any.
+ */
+	OpenFile* findStream(const uint16_t aFCB) {
+		for (auto& f : files) {
+			if (f.fcb && f.fcb == aFCB) return &f;
+		}
+		return nullptr;
+	}
+
+/**
+ * Open a host file for a FCB; read/write if possible, read only otherwise.
+ * When all the slots are used, the least recently used file is closed: it is
+ * reopened by stream() if the program uses it again.
+ * @return the opened file or nullptr.
+ */
+	OpenFile* openStream(const uint16_t aFCB, const FCB_t *const pFCB, const uint8_t memory[],
+						 const std::filesystem::path& path, const std::ios::openmode mode = {}) {
+		OpenFile* pFile = findStream(aFCB);
+		if (!pFile) {
+			pFile = std::min_element(std::begin(files), std::end(files), [](const OpenFile& a, const OpenFile& b) {
+				return a.used < b.used;
+			});
+		}
+		release(*pFile);
+		pFile->stream.open(path, std::ios::binary | std::ios::in | std::ios::out | mode);
+		if (!pFile->stream.is_open() && !(mode & std::ios::trunc)) {
+			pFile->stream.clear();
+			pFile->stream.open(path, std::ios::binary | std::ios::in);
+		}
+		if (!pFile->stream.is_open()) {
+			pFile->stream.clear();
+			return nullptr;
+		}
+		pFile->fcb = aFCB;
+		pFile->drive = fcbDrive(pFCB, memory);
+		fcbName(pFCB, pFile->name);
+		pFile->path = path;
+		pFile->used = ++useCounter;
+		return pFile;
+	}
+
+/**
+ * Return the stream to use for I/O with a FCB, reopening the file when the
+ * program uses a FCB that is not (or no longer) opened here.
+ * @return the file or nullptr if it doesn't exist.
+ */
+	OpenFile* stream(const uint16_t aFCB, const FCB_t *const pFCB, const uint8_t memory[]) {
+		char name[11];
+		fcbName(pFCB, name);
+		OpenFile *const pFile = findStream(aFCB);
+		if (pFile && pFile->drive == fcbDrive(pFCB, memory) && !memcmp(pFile->name, name, sizeof(name))) {
+			pFile->used = ++useCounter;
+			return pFile;
+		}
+		const auto path = hostPath(pFCB, memory);
+		std::error_code ec;
+		if (!std::filesystem::is_regular_file(path, ec)) return nullptr;
+		return openStream(aFCB, pFCB, memory, path);
+	}
+
+/**
+ * Close a file & free its slot.
+ */
+	void release(OpenFile& file) {
+		if (file.stream.is_open()) file.stream.close();
+		file.stream.clear();
+		file.fcb = 0;
+		file.path.clear();
+		file.used = 0;
+	}
+
+/**
+ * Close any file opened on this path (before deleting or renaming it).
+ */
+	void releasePath(const std::filesystem::path& path) {
+		for (auto& f : files) {
+			if (f.fcb && f.path == path) release(f);
 		}
 	}
 
 /**
- * BDOS function 37
+ * Read a record into buf; a partial last record is padded with ^Z.
+ * @return 0 if OK, 1 at end of file.
  */
-	void resetDrive(Z80& cpu, uint8_t *const memory);
-
-/**
- * BDOS function 40
- */
-	void writeRandomWithZeroFill(Z80& cpu, uint8_t *const memory);
-
-
-
-/**
- * Return a free fstream and set it as occuped.
- * @return a reference on a free fstream.
- */
-	std::fstream& getStream(const uint16_t aFCB) {
-		assert(aFCB);
-		for (auto i = 0; i < 10; ++i) {
-			if (FCB[i] == aFCB) return *fileStream[i];
-		}
-		for (auto i = 0; i < 10; ++i) {
-			if (fileStream[i] == NULL) {
-				fileStream[i] = new std::fstream;
-				FCB[i] = aFCB;
-				return *fileStream[i];
-			}
-		}
-		std::cerr << "Can't get another stream in BDOS::getStream!" << std::endl;
-		throw(std::runtime_error("Can't get another stream in BDOS::getStream!"));
+	uint8_t readRecord(OpenFile& file, const uint32_t record, uint8_t *const buf) {
+		auto& s = file.stream;
+		s.clear();
+		s.seekg(std::streamoff(record) * SECTOR_SIZE);
+		s.read(reinterpret_cast<char*>(buf), SECTOR_SIZE);
+		const auto n = s.gcount();
+		s.clear();
+		if (n <= 0) return 0x01;	// EOF - Nothing read
+		if (n < SECTOR_SIZE) memset(buf + n, 0x1A, SECTOR_SIZE - n);	// padding with ^Z
+		return 0x00;
 	}
-	
+
 /**
- * Release the fstream sent.
- * @param sStream a fstream to be released.
+ * Write a record from buf; writing past the end of file fills the gap with zeroes.
+ * @return 0 if OK, 0FFh on error.
  */
-	void releaseStream(const uint16_t aFCB) {
-		assert(aFCB);
-		for (auto i = 0; i < 10; ++i) {
-			if (FCB[i] == aFCB) {
-				delete fileStream[i];
-				fileStream[i] = NULL;
-				FCB[i] = 0;
-				return;
-			}
+	uint8_t writeRecord(OpenFile& file, const uint32_t record, const uint8_t *const buf) {
+		auto& s = file.stream;
+		s.clear();
+		s.seekp(std::streamoff(record) * SECTOR_SIZE);
+		s.write(reinterpret_cast<const char*>(buf), SECTOR_SIZE);
+		s.flush();
+		if (!s) {
+			std::cerr << ">> Error writing '" << file.path.string() << "': " << strerror(errno) << "!" << std::endl;
+			s.clear();
+			return 0xFF;
 		}
-		std::cerr << "Can't release this stream in BDOS::getStream!" << std::endl;
-		throw(std::runtime_error("Can't release this stream in BDOS::getStream!"));
+		return 0x00;
+	}
+
+/**
+ * Sequential position (record number) held by S2, EX & CR.
+ */
+	static uint32_t fcbRecord(const FCB_t *const pFCB) {
+		return (uint32_t(pFCB->S2 & 0x7F) * EXTENTS_PER_MODULE + (pFCB->EX & 0x1F)) * RECORDS_PER_EXTENT + pFCB->CR;
+	}
+
+/**
+ * Set S2, EX & CR to a record number, and RC to the records of that extent.
+ */
+	void setFcbRecord(FCB_t *const pFCB, const uint32_t record, const OpenFile& file) const {
+		pFCB->CR = record % RECORDS_PER_EXTENT;
+		pFCB->EX = (record / RECORDS_PER_EXTENT) % EXTENTS_PER_MODULE;
+		pFCB->S2 = record / (RECORDS_PER_EXTENT * EXTENTS_PER_MODULE);
+		pFCB->RC = extentRecords(file, record);
+	}
+
+/**
+ * Number of records of the file in the extent holding this record (0-128).
+ */
+	uint8_t extentRecords(const OpenFile& file, const uint32_t record) const {
+		std::error_code ec;
+		const auto size = std::filesystem::file_size(file.path, ec);
+		if (ec) return 0;
+		const uint32_t records = (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+		const uint32_t first = record - record % RECORDS_PER_EXTENT;
+		return records <= first ? 0 : std::min(records - first, RECORDS_PER_EXTENT);
+	}
+
+	static uint32_t randomRecord(const FCB_t *const pFCB) {
+		return pFCB->R[0] | (pFCB->R[1] << 8) | (pFCB->R[2] << 16);
+	}
+
+	static void setRandomRecord(FCB_t *const pFCB, const uint32_t record) {
+		pFCB->R[0] = record & 0xff;
+		pFCB->R[1] = (record >> 8) & 0xff;
+		pFCB->R[2] = (record >> 16) & 0xff;
 	}
 
 /**
@@ -1027,89 +1281,135 @@ protected:
 		Z80_H(cpu) = Z80_B(cpu) = b;
 	}
 
-/**
- * Convert CP/M file name (space padding) to Dos (dot separator).
- */
-	void filenameCPM2DOS(const char cpm[11], char dos[]) const {
-		char name[9];
-		memcpy(name, cpm, 8);
-		name[8] = '\0';
-		
-		for (auto i = 7; (i >= 0) && (name[i] == ' '); --i) name[i] = '\0';
-		strcpy(dos, name);
-		
-		char ext[4];
-		for(int i = 0; i < 4; ++i) ext[i] = toupper(cpm[i+8]);
+	static FCB_t* fcbAt(uint8_t memory[], const uint16_t addr) {
+		return reinterpret_cast<FCB_t*>(memory + addr);
+	}
 
-		if (ext[2] == ' ') {
-			if (ext[1] == ' ') {
-				if (ext[0] == ' ') return;	// no ext
-				ext[1] = '\0';
-			} else ext[2] = '\0';
-		} else ext[3] = '\0';
-		strcat(strcat(dos, "."), ext);
+	static const FCB_t* fcbAt(const uint8_t memory[], const uint16_t addr) {
+		return reinterpret_cast<const FCB_t*>(memory + addr);
+	}
+
+	bool dmaFits(const unsigned size) const {
+		return dma + size <= MEMORY_SIZE * 1024U;
 	}
 
 /**
- * Convert Dos file name (dot separator) to CP/M (space padding).
+ * Drive used by a FCB: its own or the current one.
  */
-	bool filenameDOS2CPM(const char dos[], char cpm[11]) const {
+	static unsigned fcbDrive(const FCB_t *const pFCB, const uint8_t memory[]) {
+		return (pFCB->DR && pFCB->DR != '?') ? (pFCB->DR - 1) & 0x0F : memory[USER_DRIVE] & 0x0F;
+	}
+
+/**
+ * Host directory of a drive.
+ */
+	static std::filesystem::path drivePath(const unsigned drive) {
+		return std::string(1, char('A' + drive));
+	}
+
+/**
+ * FCB name & type without attribute bits, in upper case (space padded).
+ */
+	static void fcbName(const FCB_t *const pFCB, char name[11]) {
+		for (auto i = 0; i < 8; ++i) name[i] = toupper(pFCB->filename[i] & 0x7F);
+		for (auto i = 0; i < 3; ++i) name[8 + i] = toupper(pFCB->filetype[i] & 0x7F);
+	}
+
+/**
+ * Compare a CP/M name to a filter, where '?' matches any character.
+ */
+	static bool matches(const char filter[11], const char name[11]) {
+		for (auto i = 0; i < 11; ++i) {
+			if ((filter[i] != '?') && (filter[i] != name[i])) return false;
+		}
+		return true;
+	}
+
+/**
+ * Host path of a file: the existing one whatever its case, else an upper case name.
+ */
+	std::filesystem::path hostPath(const unsigned drive, const char name[11]) const {
+		const auto dir = drivePath(drive);
+		std::error_code ec;
+		for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+			char cpm[11];
+			if (filenameDOS2CPM(entry.path().filename().string().c_str(), cpm) &&
+				!memcmp(cpm, name, sizeof(cpm))) {
+				return entry.path();
+			}
+		}
+		char dos[13];
+		filenameCPM2DOS(name, dos);
+		return dir / dos;
+	}
+
+	std::filesystem::path hostPath(const FCB_t *const pFCB, const uint8_t memory[]) const {
+		char name[11];
+		fcbName(pFCB, name);
+		return hostPath(fcbDrive(pFCB, memory), name);
+	}
+
+/**
+ * Convert CP/M file name (space padding) to Dos (dot separator).
+ */
+	static void filenameCPM2DOS(const char cpm[11], char dos[13]) {
+		auto p = dos;
+		for (auto i = 0; i < 8; ++i) {
+			if (cpm[i] != ' ') *p++ = cpm[i];
+		}
+		if (memcmp(cpm + 8, "   ", 3)) {
+			*p++ = '.';
+			for (auto i = 8; i < 11; ++i) {
+				if (cpm[i] != ' ') *p++ = cpm[i];
+			}
+		}
+		*p = '\0';
+	}
+
+/**
+ * Convert Dos file name (dot separator) to CP/M (space padding, upper case).
+ * @return false if this is not a valid 8.3 name.
+ */
+	static bool filenameDOS2CPM(const char dos[], char cpm[11]) {
 		char f[11];
 		memset(f, ' ', 11);
 
 		const auto p = strchr(dos, '.');
-		const auto l = p ? p - dos : strlen(dos);
-		if (l > 8) return false;	// Invalid CPM name
+		const auto l = p ? size_t(p - dos) : strlen(dos);
+		if (l == 0 || l > 8) return false;	// Invalid CPM name
 		for (unsigned i = 0; i < l; ++i) {
 			f[i] = toupper(dos[i]);
 		}
 		if (p) {
-			const auto l = strlen(dos) - (p - dos + 1);
+			const auto l = strlen(p + 1);
 			if (l > 3) return false;
 			for (unsigned i = 0; i < l; ++i) {
 				f[8 + i] = toupper(p[i + 1]);
 			}
 		}
+		for (const auto c : f) {
+			if (c < ' ' || c > '~' || c == '.' || c == '?' || c == '*') return false;
+		}
 		memcpy(cpm, f, 11);
 		return true;
 	}
-	
+
 /**
- * Find a conform file giving a Directory_Iterator.
+ * Page zero jump to the BDOS, and BDOS signature.
+ * Programs may use memory up to BDOS+5, so the signature (tested by the CCP
+ * before loading a program; it halts if wrong) is restored at each warm boot.
  */
-	bool findFile(std::filesystem::directory_iterator& di, const char filter[12], char filename[12]) const {
-		while (di != end(di)) {
-			const auto& file = *di;		// Directory Entry
-			if (file.is_regular_file() && 
-				filenameDOS2CPM(file.path().filename().string().c_str(), filename)) {
+	void vectors(uint8_t *const memory) const {
+		memory[0x0005] = 0xC3;						// JUMP
+		memory[0x0006] = (BDOS_ADDR + 6) & 0xFF;	// BDOS+6 (LL)
+		memory[0x0007] = (BDOS_ADDR + 6) >> 8;		// BDOS+6 (HH)
 
-				filename[11] = '\0';
-		
-				bool ok = true;
-				for (auto i = 0; i < 11; ++i) {
-					if ((filter[i] != '?') && (filter[i] != filename[i])) {
-						ok = false;
-						break;
-					}
-				}
-				if (ok) return true;	// valid for filter
-			}
-			++di;
-		}
-		return false;
-	}
-	
-/**
- * Extract a Dos path/filename from FCB.
- */
-	void fcbToFilename(const FCB_t *const pFCB, const unsigned char drive, char path[15]) const {
-		// filename[15];	// DIR + "/" + NAME + "." + EXT
-
-		const char dir[2] = { char('A' + (pFCB->DR ? pFCB->DR-1 : drive)), '\0' };
-
-		char filename[13];
-		filenameCPM2DOS(pFCB->filename, filename);
-		strcat(strcat(strcpy(path, dir), "/"), filename);
+		memory[BDOS_ADDR + 0] = 0x00;			// BDOS SIGNATURE
+		memory[BDOS_ADDR + 1] = 0x16;			// CPM ver 22 dec.
+		memory[BDOS_ADDR + 2] = 0x00;
+		memory[BDOS_ADDR + 3] = 0x00;
+		memory[BDOS_ADDR + 4] = 0x00;
+		memory[BDOS_ADDR + 5] = 0x00;
 	}
 
 private:
@@ -1117,35 +1417,43 @@ private:
  * Sector size (fixed to 128 for CP/M 2.2.
  */
 	static constexpr auto SECTOR_SIZE = 128U;
+	static constexpr auto RECORDS_PER_EXTENT = 128U;	// 16K logical extent
+	static constexpr auto EXTENTS_PER_MODULE = 32U;
+	static constexpr auto RECORDS_PER_BLOCK = 16U;		// 2K blocks
+	static constexpr auto DIR_ENTRY_SIZE = 32U;
 
 /**
- * Current address for user (H) & drive (L)
+ * Page zero: IOBYTE, and current user (H) & drive (L)
  */
+	static constexpr auto IOBYTE = 3U;
 	static constexpr auto USER_DRIVE = 4U;
+
+	static constexpr uint16_t DEFAULT_DMA = 0x0080;
+
+/**
+ * Disk Parameter Block & allocation vector, in the BDOS area.
+ */
+	static constexpr uint16_t DPB_ADDR = BDOS_ADDR + 0x10;
+	static constexpr uint16_t ALV_ADDR = BDOS_ADDR + 0x20;
+	static constexpr auto ALV_SIZE = 256U;	// (DSM + 1) / 8
+
+	static constexpr auto MAX_FILES = 16U;
 
 /**
  * DMA's address.
  */
-	uint16_t dma = 128U;
+	uint16_t dma = DEFAULT_DMA;
 
 /**
- * Scanning a path.
+ * Files found by searchForFirst, and next one to return.
  */
-	std::filesystem::directory_iterator di;
+	std::vector<Entry> found;
+	size_t nextFound = 0;
 
 /**
- * Filter used during scanning a path.
+ * Files opened through FCBs.
  */
-	char filter[12] = "";
-	
-/**
- * List of FCB
- */
-	uint16_t FCB[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-
-/**
- * List of fstream associated with FCBs.
- */
-	std::fstream* fileStream[10] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+	OpenFile files[MAX_FILES];
+	unsigned long useCounter = 0;
 
 };

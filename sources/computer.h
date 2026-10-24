@@ -18,11 +18,13 @@
 
 #include <cassert>
 
+#include <cstring>
 #include <iostream>
 #include <iomanip>
 #include <string>
 #include <fstream>
 #include <exception>
+#include <vector>
 
 #include <Z80.h>
 #include "bdos.h"
@@ -110,15 +112,24 @@
  
 template <unsigned MEMORY_SIZE, uint16_t BDOS_ADDR, uint16_t BIOS_ADDR>
 class Computer {
-	const char* _prog;
-	const unsigned _addr;
+	static_assert(MEMORY_SIZE <= 64, "The Z80 addresses 64K at most");
+
+	const std::string _prog;
+	const uint16_t _addr;
+	const std::vector<std::string> _args;
 public:
 /**
  * Constructor printing out somme copyright texts.
+ * @param prog Binary to run: the CCP, or a CP/M program.
+ * @param addr Address where to load & start it. A program loaded at TPA
+ * (0100h) is run alone, with args as command line, and ends at warm boot;
+ * otherwise prog is the CCP, reloaded at each warm boot.
+ * @param args Command line arguments of a program.
  */
-	Computer(const char* prog, const unsigned addr) : 
+	Computer(const std::string& prog, const uint16_t addr, const std::vector<std::string>& args = {}) : 
 		_prog(prog),
 		_addr(addr),
+		_args(args),
 		cpu(),
 		memory(),
 		bdos(),
@@ -146,25 +157,32 @@ public:
 	};
 	
 /**
- * Initialize cpu and BDOS ; optionaly load program (CPP) at designed address.
- * @param aFilename Path to binary to load in memory.
- * @param aAddr Memory address where to load the binary.
+ * Initialize cpu, BIOS and BDOS (cold boot).
  */
-	void init(const std::string& aFilename = "", const uint16_t aAddr = 0) {
+	void init() {
 		z80_instant_reset(&cpu);
 		
 		bios.init(memory);
 		bdos.init(memory);
-
-		if (!aFilename.empty() && aAddr) {
-			load(aFilename, aAddr);
-			Z80_BC(cpu) = 0;
-		}
 	}
 
+/**
+ * Cold boot then run until the program ends.
+ */
 	void start() {
-		init(_prog, _addr);
-		run(_addr);
+		init();
+		if (isProgram()) {
+			load(_prog, TPA);
+			setCommandLine();
+		// Stack under the BDOS, with 0000h as return address
+			Z80_SP(cpu) = BDOS_ADDR;
+			memory[--Z80_SP(cpu)] = 0x00;
+			memory[--Z80_SP(cpu)] = 0x00;
+			Z80_PC(cpu) = TPA;
+		} else {
+			loadCCP();
+		}
+		run();
 	}
 
 /**
@@ -178,11 +196,11 @@ public:
 		auto fs = std::ifstream(aFile, std::ios_base::binary | std::ios_base::in);
 		if (fs) {
 //			std::clog << "Loading " << aFile << "... ";
-			auto addr = aAddr;
+			unsigned addr = aAddr;
 			while (fs.good()) {
 				const uint8_t c = fs.get();
 				if (!fs.eof()) {
-					if (addr >= MEMORY_SIZE * 1024L) {
+					if (addr >= MEMORY_SIZE * 1024U) {
 						constexpr char WRITING_OUT_OF_MEMORY[] = "Writing out of memory";
 						std::cerr << ">> " << WRITING_OUT_OF_MEMORY << ": "
 								  << std::hex << addr << std::endl;
@@ -200,54 +218,37 @@ public:
 		}
 	}
 	
-	void run(const uint16_t aAddr=0x0100) {
-		assert(aAddr);	// > 0
-		Z80_PC(cpu) = aAddr;
+/**
+ * Run from the current PC until the end: a warm boot when running a lone program.
+ */
+	void run() {
 		while (true) {
-			if (Z80_PC(cpu) >= MEMORY_SIZE * 1024) {
-				constexpr char EXECUTING_OUT_OF_MEMORY[] = "Executing out of memory!";
-				std::cerr << ">> " << EXECUTING_OUT_OF_MEMORY << std::endl;
-				throw std::runtime_error(EXECUTING_OUT_OF_MEMORY);
-			}
-			
-			if (Z80_PC(cpu) == 0x0000) {	// Reset
+			const uint16_t pc = Z80_PC(cpu);
+
+			if (pc == 0x0000 || pc == Bios::BOOT_ADDR || pc == Bios::WBOOT_ADDR) {	// Reset / warm boot
 #ifdef LOG
 				logSpecAddr();
 #endif
-				return;
+				if (isProgram()) return;
+				warmBoot();
+				continue;
 			} 
 			
-			if (Z80_PC(cpu) == 0x0003) {	// Warm boot
-#ifdef LOG
-				logSpecAddr();
-#endif
-				return;
-			} 
-			
-			if (Z80_PC(cpu) == 0x0005) {	// BDOS
+			if (pc == 0x0005 || pc == BDOS_ADDR + 6) {	// BDOS
 #ifdef LOG
 				logSpecAddr();
 #endif
 				bdos.function(cpu, memory);
-				if (Z80_PC(cpu) == 0) {
-					start();
-				}
-				else {
-					// Return
-					Z80_PC(cpu) = memory[Z80_SP(cpu)++];
-					Z80_PC(cpu) += memory[Z80_SP(cpu)++] * 256U;
-					continue;
-				}
+				if (Z80_PC(cpu) != 0x0000) ret();	// else warm boot
+				continue;
 			}
 
-			if (Z80_PC(cpu) >= BIOS_ADDR) {	// BIOS
+			if (pc >= BIOS_ADDR) {	// BIOS
 #ifdef LOG
 				logSpecAddr();
 #endif
 				bios.function(cpu, memory);
-			// Return
-				Z80_PC(cpu) = memory[Z80_SP(cpu)++];
-				Z80_PC(cpu) += memory[Z80_SP(cpu)++] * 256U;
+				ret();
 				continue;
 			}
 
@@ -255,16 +256,21 @@ public:
 			logSpecAddr();
 			logInst();
 #endif
-			if (memory[Z80_PC(cpu)] == 0x76)  {		// HALT
+			if (memory[pc] == 0x76)  {		// HALT
 				constexpr char HALT_INSTRUCTION[] = "HALT instruction";
 				std::cerr << ">> "<< HALT_INSTRUCTION << " at "
 						  << std::hex << std::setw(4) 
-						  << Z80_PC(cpu) << "!" << std::endl;
+						  << pc << "!" << std::endl;
 				throw std::runtime_error(HALT_INSTRUCTION);
 			}
 			z80_run(&cpu, 1);	// return cycles
 		}
 	}
+
+/**
+ * Start of the Transient Program Area.
+ */
+	static constexpr uint16_t TPA = 0x0100;
 
 /**
  * BIAS value is more or less the last free address for programs.
@@ -273,21 +279,78 @@ public:
 	
 protected:
 	
-/**
- * Reset computer set all low-memory values & lauche warm boot
- */
-	void reset() {
-		warmBoot();
+	bool isProgram() const {
+		return _addr == TPA;
 	}
-	
+
 /**
- * Lauch & run CP/M CCP
+ * Return from a BDOS/BIOS call: pop PC.
+ */
+	void ret() {
+		Z80_PC(cpu) = memory[Z80_SP(cpu)++];
+		Z80_PC(cpu) += memory[Z80_SP(cpu)++] * 256U;
+	}
+
+	void loadCCP() {
+		load(_prog, _addr);
+		Z80_C(cpu) = memory[0x0004];	// Current user & drive, for the CCP
+		Z80_PC(cpu) = _addr;
+	}
+
+/**
+ * Close files, restore page zero vectors & reload the CCP (the drive and
+ * user are kept).
  */
 	void warmBoot() {
-//		load(CCP_FILENAME, 0x3400 + Computer::BIAS);
-		Z80_PC(cpu) = 0x3400 + Computer::BIAS;
+		bios.init(memory);
+		bdos.reset(memory);
+		loadCCP();
 	}
-	
+
+/**
+ * Set up the command tail (0080h) and the default FCBs (005Ch & 006Ch) with
+ * the arguments, as the CCP would do.
+ */
+	void setCommandLine() {
+		std::string tail;
+		for (const auto& arg : _args) tail += ' ' + arg;
+		for (auto& c : tail) c = toupper(c);
+		if (tail.size() > 126) tail.resize(126);
+		memory[0x0080] = tail.size();
+		memcpy(memory + 0x0081, tail.data(), tail.size());
+		memory[0x0081 + tail.size()] = 0x00;
+
+		memset(memory + 0x005C, 0, 0x0080 - 0x005C);
+		setFCB(memory + 0x005C, _args.size() > 0 ? _args[0] : "");
+		setFCB(memory + 0x006C, _args.size() > 1 ? _args[1] : "");
+	}
+
+/**
+ * Parse "d:name.typ" (with * wildcards) into a FCB.
+ */
+	static void setFCB(uint8_t *const fcb, const std::string& arg) {
+		memset(fcb + 1, ' ', 11);
+		auto p = arg.c_str();
+		if (*p && p[1] == ':') {
+			fcb[0] = toupper(*p) - 'A' + 1;
+			p += 2;
+		}
+		auto field = [&](unsigned offset, unsigned size) {
+			for (unsigned i = 0; *p && *p != '.'; ++p) {
+				if (*p == '*') {
+					while (i < size) fcb[offset + i++] = '?';
+				} else if (i < size) {
+					fcb[offset + i++] = toupper(*p);
+				}
+			}
+		};
+		field(1, 8);
+		if (*p == '.') {
+			++p;
+			field(9, 3);
+		}
+	}
+
 /**
  * Callback used by Z80 to read from the memory.
  * @param context Pointer on Computer's instance.
@@ -1237,6 +1300,7 @@ private:
 /**
  * BDOS functions & variables.
  */
- 	BIOS<MEMORY_SIZE, BIOS_ADDR> bios;
+ 	using Bios = BIOS<MEMORY_SIZE, BIOS_ADDR>;
+ 	Bios bios;
  	
 };

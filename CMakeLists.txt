@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.3)
+cmake_minimum_required(VERSION 3.5...3.31)
 
 if(	CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR AND
 	NOT CMAKE_BUILD_TYPE AND
@@ -19,5 +19,6 @@ set(Z80_WITH_ZILOG_NMOS_LD_A_IR_BUG YES CACHE BOOL "")
 
 add_subdirectory(external/Z80)
 add_executable(cpm "${CMAKE_CURRENT_SOURCE_DIR}/sources/main.cpp")
+target_compile_features(cpm PRIVATE cxx_std_17)
 target_link_libraries(cpm PRIVATE Z80)
 install(TARGETS cpm RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
