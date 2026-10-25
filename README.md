@@ -72,6 +72,32 @@ In an existing clone, get the submodules with `git submodule update --init`.
 
 The console uses POSIX terminal functions (Linux, macOS).
 
+### Host console & files
+
+The emulator reaches its host only through two headers, picked by the include path:
+
+* `host_console.h`: keys in and characters out (`conctrl_init()`, `conctrl_putc()`, `conctrl_status()`,
+  `conctrl_kbhit()`, `conctrl_getch()`, `conctrl_getch_wait()`; see [`console.h`](sources/console.h)).
+* `host_fs.h`: the files of the drives (namespace `hostfs`), by path: `A/DUMP.COM`...
+
+The desktop build uses [`sources/host/std`](sources/host/std) (the terminal, and `std::filesystem` in the
+current directory). [`sources/host/fatfs`](sources/host/fatfs) puts the drives on a FAT file system
+through [FatFs](http://elm-chan.org/fsw/ff/), e.g. an SD card on a microcontroller.
+
+To build the emulator into another program, e.g. with the Raspberry Pi Pico SDK:
+
+```cmake
+include(path/to/CPM-Emulator/cpm_emulator.cmake)
+target_link_libraries(my_app cpm_emulator fatfs)
+target_include_directories(my_app PRIVATE
+  my_host_console_dir                        # host_console.h
+  path/to/CPM-Emulator/sources/host/fatfs)   # host_fs.h
+```
+
+The emulator reports errors with C++ exceptions, and these can pass through the Z80 core (`Z80.c`):
+build both it and the code catching them with `-fexceptions`.
+[pico-hstx-dvi](https://github.com/fruit-bat/pico-hstx-dvi) (`apps/hstx_dvi_cpm`) does this on a Pico 2.
+
 ## Release History
 
 * 0.3

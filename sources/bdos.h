@@ -22,17 +22,12 @@
 #include <cctype>
 #include <cstring>
 #include <algorithm>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
 #include "console.h"
-
-#if __cplusplus < 201703L
-#error "Need C++17 compiler for using <filesystem>"
-#endif
-#include <filesystem>
+#include "host_fs.h"	// The host's files, from the host directory of the build
 
 // #define LOG 1
 
@@ -80,7 +75,7 @@ static_assert(sizeof(FCB_t) == 36, "FCB must be 36 bytes");
 
 /**
  * Emulated BDOS. Disks A: to P: are the host directories "A" to "P" in the
- * current directory; files are host files with a 8.3 name.
+ * current directory; files are host files with a 8.3 name (see host_fs.h).
  *
  * The BDOS area (BDOS_ADDR) holds, after the 6 bytes signature, a fake Disk
  * Parameter Block and allocation vector (0x120 bytes in all) for programs
@@ -452,14 +447,11 @@ protected:
 		userDrive &= 0xF0;	// DRIVE: 0 (A), user unchanged
 		dma = DEFAULT_DMA;
 	// 0FFh if a file name begins with '$' (the CCP then looks for $$$.SUB)
-		std::error_code ec;
-		for (const auto& entry : std::filesystem::directory_iterator(drivePath(0), ec)) {
-			if (entry.path().filename().string()[0] == '$') {
-				returnCode(cpu, 0xFF);
-				return;
-			}
-		}
-		returnCode(cpu, 0);
+		bool dollar = false;
+		hostfs::listFiles(drivePath(0), [&](const char *const name, uint32_t) {
+			if (name[0] == '$') dollar = true;
+		});
+		returnCode(cpu, dollar ? 0xFF : 0);
 	}
 
 /**
@@ -480,7 +472,7 @@ protected:
 			return;
 		}
 
-		if (std::filesystem::is_directory(drivePath(Z80_E(cpu)))) {
+		if (hostfs::isDirectory(drivePath(Z80_E(cpu)))) {
 			userDrive = (userDrive & 0xF0) | (Z80_E(cpu) & 0x0F);
 			returnCode(cpu, 0x00);
 			return;
@@ -516,8 +508,7 @@ protected:
 				  << std::endl;
 #endif
 
-		std::error_code ec;
-		OpenFile *const pFile = std::filesystem::is_regular_file(path, ec)
+		OpenFile *const pFile = hostfs::isFile(path)
 			? openStream(Z80_DE(cpu), pFCB, memory, path)
 			: nullptr;
 		if (!pFile) {
@@ -546,19 +537,20 @@ protected:
 		const FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
 		const auto path = hostPath(pFCB, memory);
 		if (auto *const pFile = findStream(Z80_DE(cpu))) release(*pFile);
-		std::error_code ec;
-		if (!std::filesystem::is_regular_file(path, ec)) {
+		uint32_t size;
+		if (!hostfs::isFile(path) || !hostfs::fileSize(path, size)) {
 			returnCode(cpu, 0xFF);	// KO
 			return;
 		}
 	// Closing writes RC to the directory: a lower RC in the last extent
 	// truncates the file (the CCP does so to consume $$$.SUB).
-		const uint32_t records = (std::filesystem::file_size(path, ec) + SECTOR_SIZE - 1) / SECTOR_SIZE;
+		const uint32_t records = (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
 		const uint32_t first = fcbRecord(pFCB) - fcbRecord(pFCB) % RECORDS_PER_EXTENT;
-		if (!ec && records > first && records <= first + RECORDS_PER_EXTENT && pFCB->RC < records - first) {
-			std::filesystem::resize_file(path, uintmax_t(first + pFCB->RC) * SECTOR_SIZE, ec);
+		bool ok = true;
+		if (records > first && records <= first + RECORDS_PER_EXTENT && pFCB->RC < records - first) {
+			ok = hostfs::resizeFile(path, (first + pFCB->RC) * SECTOR_SIZE);
 		}
-		returnCode(cpu, ec ? 0xFF : 0x00);
+		returnCode(cpu, ok ? 0x00 : 0xFF);
 	}
 
 /**
@@ -585,28 +577,24 @@ protected:
 		found.clear();
 		nextFound = 0;
 		const auto path = drivePath(fcbDrive(pFCB));
-		std::error_code ec;
-		std::filesystem::directory_iterator di(path, ec);
-		if (ec) {
-			std::cerr << ">> Error looking for path '" << path.string() << "': " << ec.message() << "!" << std::endl;
-			returnCode(cpu, 0xFF);	// KO
-			return;
-		}
-		for (const auto& entry : di) {
+		const bool listed = hostfs::listFiles(path, [&](const char *const name, const uint32_t size) {
 			Entry e;
-			if (entry.is_regular_file(ec) &&
-				filenameDOS2CPM(entry.path().filename().string().c_str(), e.name) &&
-				matches(filter, e.name)) {
+			if (filenameDOS2CPM(name, e.name) && matches(filter, e.name)) {
 			// One directory entry by 16K extent: all of them if EX is '?', else the one asked
-				const uint32_t records = (entry.file_size(ec) + SECTOR_SIZE - 1) / SECTOR_SIZE;
+				const uint32_t records = (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
 				const uint32_t extents = records ? (records + RECORDS_PER_EXTENT - 1) / RECORDS_PER_EXTENT : 1;
 				for (e.extent = 0; e.extent < extents; ++e.extent) {
 					if (allExtents || e.extent == wanted) {
-						e.records = std::min(records - e.extent * RECORDS_PER_EXTENT, RECORDS_PER_EXTENT);
+						e.records = std::min<uint32_t>(records - e.extent * RECORDS_PER_EXTENT, RECORDS_PER_EXTENT);
 						found.push_back(e);
 					}
 				}
 			}
+		});
+		if (!listed) {
+			std::cerr << ">> Error looking for path '" << path << "': " << hostfs::lastError() << "!" << std::endl;
+			returnCode(cpu, 0xFF);	// KO
+			return;
 		}
 		std::sort(found.begin(), found.end(), [](const Entry& a, const Entry& b) {
 			const auto c = memcmp(a.name, b.name, sizeof(a.name));
@@ -665,29 +653,24 @@ protected:
 		fcbName(pFCB, filter);
 
 		const auto path = drivePath(fcbDrive(pFCB));
-		std::error_code ec;
-		std::filesystem::directory_iterator di(path, ec);		// New directory_iterator
-		if (ec) {
-			std::cerr << ">> Error looking for path '" << path.string() << "': " << ec.message() << "!" << std::endl;
+
+	// Collect first, so that the directory is not changed while scanning it
+		std::vector<std::string> victims;
+		const bool listed = hostfs::listFiles(path, [&](const char *const dos, uint32_t) {
+			char name[11];
+			if (filenameDOS2CPM(dos, name) && matches(filter, name)) {
+				victims.push_back(path + '/' + dos);
+			}
+		});
+		if (!listed) {
+			std::cerr << ">> Error looking for path '" << path << "': " << hostfs::lastError() << "!" << std::endl;
 			returnCode(cpu, 0xFF);	// KO
 			return;
 		}
-
-	// Collect first, so that the directory is not changed while scanning it
-		std::vector<std::filesystem::path> victims;
-		for (const auto& entry : di) {
-			char name[11];
-			if (entry.is_regular_file(ec) &&
-				filenameDOS2CPM(entry.path().filename().string().c_str(), name) &&
-				matches(filter, name)) {
-				victims.push_back(entry.path());
-			}
-		}
 		for (const auto& victim : victims) {
 			releasePath(victim);
-			std::filesystem::remove(victim, ec);
-			if (ec) {
-				std::cerr << ">> Error removing '" << victim.string() << "': " << ec.message() << "!" << std::endl;
+			if (!hostfs::removeFile(victim)) {
+				std::cerr << ">> Error removing '" << victim << "': " << hostfs::lastError() << "!" << std::endl;
 				returnCode(cpu, 0xFF);	// KO
 				return;
 			}
@@ -780,8 +763,8 @@ protected:
 		std::clog << "Make file " << path << " (FCB: " << std::hex << unsigned(Z80_DE(cpu)) << "h)" << std::endl;
 #endif
 		releasePath(path);
-		if (!openStream(Z80_DE(cpu), pFCB, memory, path, std::ios::trunc)) {
-			std::cerr << ">> Error creating file '" << path.string() << "': " << strerror(errno) << "!" << std::endl;
+		if (!openStream(Z80_DE(cpu), pFCB, memory, path, true)) {
+			std::cerr << ">> Error creating file '" << path << "': " << hostfs::lastError() << "!" << std::endl;
 			returnCode(cpu, 0xFF);
 			return;
 		}
@@ -809,15 +792,13 @@ protected:
 #if LOG
 		std::clog << "Rename file " << from << " to " << to << std::endl;
 #endif
-		std::error_code ec;
-		if (!std::filesystem::is_regular_file(from, ec) || std::filesystem::exists(to, ec)) {
+		if (!hostfs::isFile(from) || hostfs::exists(to)) {
 			returnCode(cpu, 0xFF);
 			return;
 		}
 		releasePath(from);
-		std::filesystem::rename(from, to, ec);
-		if (ec) {
-			std::cerr << ">> Error renaming '" << from.string() << "': " << ec.message() << "!" << std::endl;
+		if (!hostfs::renameFile(from, to)) {
+			std::cerr << ">> Error renaming '" << from << "': " << hostfs::lastError() << "!" << std::endl;
 			returnCode(cpu, 0xFF);
 			return;
 		}
@@ -837,8 +818,7 @@ protected:
 #endif
 		uint16_t actives = 0;
 		for (auto d = 0; d <= 15; ++d) {
-			std::error_code ec;
-			if (std::filesystem::is_directory(drivePath(d), ec)) actives |= (1 << d);
+			if (hostfs::isDirectory(drivePath(d))) actives |= (1 << d);
 		}
 		returnCode(cpu, actives);
 	}
@@ -920,8 +900,7 @@ protected:
  * Attributes are not stored: only checks that the file exists.
  */
 	void setFileAttributes(Z80& cpu, const uint8_t memory[]) {
-		std::error_code ec;
-		const bool ok = std::filesystem::is_regular_file(hostPath(fcbAt(memory, Z80_DE(cpu)), memory), ec);
+		const bool ok = hostfs::isFile(hostPath(fcbAt(memory, Z80_DE(cpu)), memory));
 		returnCode(cpu, ok ? 0x00 : 0xFF);
 	}
 
@@ -1046,9 +1025,8 @@ protected:
 	void computeFileSize(Z80& cpu, uint8_t *const memory) {
 		assert(memory);
 		FCB_t *const pFCB = fcbAt(memory, Z80_DE(cpu));
-		std::error_code ec;
-		const auto size = std::filesystem::file_size(hostPath(pFCB, memory), ec);
-		if (ec) {
+		uint32_t size;
+		if (!hostfs::fileSize(hostPath(pFCB, memory), size)) {
 			returnCode(cpu, 0xFF);
 			return;
 		}
@@ -1097,8 +1075,8 @@ protected:
 		uint16_t fcb = 0;			// FCB address, 0 if free
 		unsigned drive = 0;			// Drive & name the FCB had when opened
 		char name[11];
-		std::filesystem::path path;
-		std::fstream stream;
+		std::string path;
+		hostfs::File file;
 		unsigned long used = 0;		// Last use, for recycling
 	};
 
@@ -1122,13 +1100,14 @@ protected:
 	}
 
 /**
- * Open a host file for a FCB; read/write if possible, read only otherwise.
+ * Open a host file for a FCB; read/write if possible, read only otherwise,
+ * or created empty if truncate.
  * When all the slots are used, the least recently used file is closed: it is
  * reopened by stream() if the program uses it again.
  * @return the opened file or nullptr.
  */
 	OpenFile* openStream(const uint16_t aFCB, const FCB_t *const pFCB, const uint8_t memory[],
-						 const std::filesystem::path& path, const std::ios::openmode mode = {}) {
+						 const std::string& path, const bool truncate = false) {
 		OpenFile* pFile = findStream(aFCB);
 		if (!pFile) {
 			pFile = std::min_element(std::begin(files), std::end(files), [](const OpenFile& a, const OpenFile& b) {
@@ -1136,15 +1115,7 @@ protected:
 			});
 		}
 		release(*pFile);
-		pFile->stream.open(path, std::ios::binary | std::ios::in | std::ios::out | mode);
-		if (!pFile->stream.is_open() && !(mode & std::ios::trunc)) {
-			pFile->stream.clear();
-			pFile->stream.open(path, std::ios::binary | std::ios::in);
-		}
-		if (!pFile->stream.is_open()) {
-			pFile->stream.clear();
-			return nullptr;
-		}
+		if (!pFile->file.open(path, truncate)) return nullptr;
 		pFile->fcb = aFCB;
 		pFile->drive = fcbDrive(pFCB);
 		fcbName(pFCB, pFile->name);
@@ -1167,8 +1138,7 @@ protected:
 			return pFile;
 		}
 		const auto path = hostPath(pFCB, memory);
-		std::error_code ec;
-		if (!std::filesystem::is_regular_file(path, ec)) return nullptr;
+		if (!hostfs::isFile(path)) return nullptr;
 		return openStream(aFCB, pFCB, memory, path);
 	}
 
@@ -1176,8 +1146,7 @@ protected:
  * Close a file & free its slot.
  */
 	void release(OpenFile& file) {
-		if (file.stream.is_open()) file.stream.close();
-		file.stream.clear();
+		file.file.close();
 		file.fcb = 0;
 		file.path.clear();
 		file.used = 0;
@@ -1186,7 +1155,7 @@ protected:
 /**
  * Close any file opened on this path (before deleting or renaming it).
  */
-	void releasePath(const std::filesystem::path& path) {
+	void releasePath(const std::string& path) {
 		for (auto& f : files) {
 			if (f.fcb && f.path == path) release(f);
 		}
@@ -1197,13 +1166,8 @@ protected:
  * @return 0 if OK, 1 at end of file.
  */
 	uint8_t readRecord(OpenFile& file, const uint32_t record, uint8_t *const buf) {
-		auto& s = file.stream;
-		s.clear();
-		s.seekg(std::streamoff(record) * SECTOR_SIZE);
-		s.read(reinterpret_cast<char*>(buf), SECTOR_SIZE);
-		const auto n = s.gcount();
-		s.clear();
-		if (n <= 0) return 0x01;	// EOF - Nothing read
+		const auto n = file.file.read(record * SECTOR_SIZE, buf, SECTOR_SIZE);
+		if (n == 0) return 0x01;	// EOF - Nothing read
 		if (n < SECTOR_SIZE) memset(buf + n, 0x1A, SECTOR_SIZE - n);	// padding with ^Z
 		return 0x00;
 	}
@@ -1213,14 +1177,8 @@ protected:
  * @return 0 if OK, 0FFh on error.
  */
 	uint8_t writeRecord(OpenFile& file, const uint32_t record, const uint8_t *const buf) {
-		auto& s = file.stream;
-		s.clear();
-		s.seekp(std::streamoff(record) * SECTOR_SIZE);
-		s.write(reinterpret_cast<const char*>(buf), SECTOR_SIZE);
-		s.flush();
-		if (!s) {
-			std::cerr << ">> Error writing '" << file.path.string() << "': " << strerror(errno) << "!" << std::endl;
-			s.clear();
+		if (!file.file.write(record * SECTOR_SIZE, buf, SECTOR_SIZE)) {
+			std::cerr << ">> Error writing '" << file.path << "': " << hostfs::lastError() << "!" << std::endl;
 			return 0xFF;
 		}
 		return 0x00;
@@ -1247,12 +1205,11 @@ protected:
  * Number of records of the file in the extent holding this record (0-128).
  */
 	uint8_t extentRecords(const OpenFile& file, const uint32_t record) const {
-		std::error_code ec;
-		const auto size = std::filesystem::file_size(file.path, ec);
-		if (ec) return 0;
+		uint32_t size;
+		if (!file.file.size(size)) return 0;
 		const uint32_t records = (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
 		const uint32_t first = record - record % RECORDS_PER_EXTENT;
-		return records <= first ? 0 : std::min(records - first, RECORDS_PER_EXTENT);
+		return records <= first ? 0 : std::min<uint32_t>(records - first, RECORDS_PER_EXTENT);
 	}
 
 	static uint32_t randomRecord(const FCB_t *const pFCB) {
@@ -1304,7 +1261,7 @@ protected:
 /**
  * Host directory of a drive.
  */
-	static std::filesystem::path drivePath(const unsigned drive) {
+	static std::string drivePath(const unsigned drive) {
 		return std::string(1, char('A' + drive));
 	}
 
@@ -1329,22 +1286,22 @@ protected:
 /**
  * Host path of a file: the existing one whatever its case, else an upper case name.
  */
-	std::filesystem::path hostPath(const unsigned drive, const char name[11]) const {
+	std::string hostPath(const unsigned drive, const char name[11]) const {
 		const auto dir = drivePath(drive);
-		std::error_code ec;
-		for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+		std::string path;
+		hostfs::listFiles(dir, [&](const char *const dos, uint32_t) {
 			char cpm[11];
-			if (filenameDOS2CPM(entry.path().filename().string().c_str(), cpm) &&
-				!memcmp(cpm, name, sizeof(cpm))) {
-				return entry.path();
+			if (path.empty() && filenameDOS2CPM(dos, cpm) && !memcmp(cpm, name, sizeof(cpm))) {
+				path = dir + '/' + dos;
 			}
-		}
+		});
+		if (!path.empty()) return path;
 		char dos[13];
 		filenameCPM2DOS(name, dos);
-		return dir / dos;
+		return dir + '/' + dos;
 	}
 
-	std::filesystem::path hostPath(const FCB_t *const pFCB, const uint8_t memory[]) const {
+	std::string hostPath(const FCB_t *const pFCB, const uint8_t memory[]) const {
 		char name[11];
 		fcbName(pFCB, name);
 		return hostPath(fcbDrive(pFCB), name);
