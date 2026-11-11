@@ -31,13 +31,23 @@
  * the reader (RDR:) and punch (PUN:):
  *   conctrl_aux_in()      wait for a byte from it
  *   conctrl_aux_out(c)    send it a byte
- * This file turns the Kaypro / ADM-3A and CP/M-86 (VT52-like) codes of CP/M
- * programs into ANSI ones. Where they differ, ESC B n and ESC C n are
- * Kaypro's (set and clear an attribute, not VT52's cursor down and right),
- * and ESC E (clear screen) and ESC Y r c (move the cursor) CP/M-86's (not
- * Kaypro's insert line and clear to end of screen). Codes that are known but
- * have no ANSI equivalent are dropped rather than passed on, as some of them
- * do something else entirely on an ANSI terminal (e.g. ESC c resets xterm).
+ * This file turns the terminal codes of CP/M programs into ANSI ones, for the
+ * terminal console_term says the programs were set up for:
+ *
+ *   CONSOLE_MIXED   (the default) the Kaypro / ADM-3A's and CP/M-86's
+ *                   (VT52-like) codes together. Where they differ, ESC B n
+ *                   and ESC C n are Kaypro's (set and clear an attribute, not
+ *                   cursor down and right), and ESC E (clear screen) and
+ *                   ESC Y r c (move the cursor) CP/M-86's (not Kaypro's insert
+ *                   line and clear to end of screen). Other codes pass on, so
+ *                   most ANSI ones work too.
+ *   CONSOLE_KAYPRO  a Kaypro (ADM-3A with attributes) only
+ *   CONSOLE_VT52    a DEC VT52 only
+ *   CONSOLE_ANSI    an ANSI terminal (VT100, xterm): everything passes on
+ *
+ * Codes that are known but have no ANSI equivalent are dropped rather than
+ * passed on, as some of them do something else entirely on an ANSI terminal
+ * (e.g. ESC c resets xterm).
  */
 #include "host_console.h"
 
@@ -108,16 +118,41 @@ inline void conctrl_clear_to_end_of_screen() {
 //     https://mdfs.net/Archive/info-cpm/1985/01/19/053100.htm
 //     https://www.cse.psu.edu/~kxc104/class/cmpen472/16f/hw/hw8/vt100ansi.htm#:~:text=Cursor%20Home%20%5B%7B,upper%20left%20of%20the%20screen.
 //
+// The terminal the programs were set up for (see above)
+enum ConsoleTerm { CONSOLE_MIXED, CONSOLE_KAYPRO, CONSOLE_VT52, CONSOLE_ANSI, CONSOLE_TERMS };
+inline ConsoleTerm console_term = CONSOLE_MIXED;
+
+inline const char* console_term_name(const ConsoleTerm t) {
+    switch (t) {
+        case CONSOLE_MIXED: return "Kaypro + CP/M-86 (mixed)";
+        case CONSOLE_KAYPRO: return "Kaypro / ADM-3A";
+        case CONSOLE_VT52: return "VT52";
+        case CONSOLE_ANSI: return "ANSI / VT100 (passed on)";
+        default: return "?";
+    }
+}
+
 // Buffer console output so we can execute control sequences. console_reset()
-// drops a part sent sequence, e.g. when a program ends.
-inline uint8_t conb[4];
+// drops a part sent sequence, e.g. when a program ends or the terminal type
+// changes.
+inline uint8_t conb[6];
 inline unsigned coni = 0;
 
 inline void console_reset() {
     coni = 0; 
 }
 
+// The length of the escape sequence started in conb
 inline unsigned console_el() {
+    if (console_term == CONSOLE_VT52) return conb[1] == 'Y' ? 4 : 2;
+    if (console_term == CONSOLE_KAYPRO) {
+        switch (conb[1]) {
+            case '=': case '*': case ' ': return 4;   // cursor, set and clear a pixel
+            case 'L': case 'D': return 6;             // draw and erase a line
+            case 'B': case 'C': return 3;             // set and clear an attribute
+            default: return 2;
+        }
+    }
     switch(conb[1]) {
         case 'Y':
         case 'd':
@@ -145,7 +180,20 @@ inline void console_output_buf() {
     }
 }
 
-inline void console_exeb() {
+// Kaypro: ESC B n / ESC C n - set / clear attribute n
+inline void console_attr(const bool set, const uint8_t n) {
+    switch(n) {
+        case '0': conctrl_esc(set ? "[7m" : "[27m"); break;     // reverse video
+        case '1': conctrl_esc(set ? "[2m" : "[22m"); break;     // half intensity
+        case '2': conctrl_esc(set ? "[5m" : "[25m"); break;     // blinking
+        case '3': conctrl_esc(set ? "[4m" : "[24m"); break;     // underline
+        case '4': conctrl_esc(set ? "[?25h" : "[?25l"); break;  // cursor on/off
+        case '6': conctrl_esc(set ? "7" : "8"); break;          // save/restore the cursor
+        default: break;
+    }
+}
+
+inline void console_exeb_mixed() {
 
     switch(conb[1]) {
 // ESC 0
@@ -158,16 +206,7 @@ inline void console_exeb() {
     }
     case 'B':   // ESC B n - Kaypro: set attribute n
     case 'C': { // ESC C n - Kaypro: clear attribute n
-        const bool set = conb[1] == 'B';
-        switch(conb[2]) {
-            case '0': conctrl_esc(set ? "[7m" : "[27m"); break;     // reverse video
-            case '1': conctrl_esc(set ? "[2m" : "[22m"); break;     // half intensity
-            case '2': conctrl_esc(set ? "[5m" : "[25m"); break;     // blinking
-            case '3': conctrl_esc(set ? "[4m" : "[24m"); break;     // underline
-            case '4': conctrl_esc(set ? "[?25h" : "[?25l"); break;  // cursor on/off
-            case '6': conctrl_esc(set ? "7" : "8"); break;          // save/restore the cursor
-            default: break;
-        }
+        console_attr(conb[1] == 'B', conb[2]);
         break;
     }
     case 'D': { // ESC D - cursor left, unless at the left-hand edge
@@ -348,6 +387,45 @@ inline void console_exeb() {
     coni = 0;
 }
 
+// A Kaypro (an ADM-3A with attributes and graphics)
+inline void console_exeb_kaypro() {
+    switch(conb[1]) {
+        case 'B': case 'C': console_attr(conb[1] == 'B', conb[2]); break;
+        case '=': conctrl_move_cursor(conb[2] - 32, conb[3] - 32); break; // ESC = r c
+        case 'E': conctrl_esc("[L"); break;                     // insert a line
+        case 'R': conctrl_esc("[M"); break;                     // delete a line
+        case 'T': conctrl_clear_to_end_of_line(); break;
+        case 'Y': conctrl_clear_to_end_of_screen(); break;
+        default: break; // Pixels, lines and anything else: dropped
+    }
+    coni = 0;
+}
+
+// A DEC VT52
+inline void console_exeb_vt52() {
+    switch(conb[1]) {
+        case 'A': conctrl_esc("[A"); break;
+        case 'B': conctrl_esc("[B"); break;
+        case 'C': conctrl_esc("[C"); break;
+        case 'D': conctrl_esc("[D"); break;
+        case 'H': conctrl_home(); break;
+        case 'I': conctrl_esc("M"); break;                      // up, scrolling at the top
+        case 'J': conctrl_clear_to_end_of_screen(); break;
+        case 'K': conctrl_clear_to_end_of_line(); break;
+        case 'Y': conctrl_move_cursor(conb[2] - 32, conb[3] - 32); break; // ESC Y r c
+        default: break; // Graphics, keypad modes, identify...: dropped
+    }
+    coni = 0;
+}
+
+inline void console_exeb() {
+    switch (console_term) {
+        case CONSOLE_KAYPRO: console_exeb_kaypro(); break;
+        case CONSOLE_VT52: console_exeb_vt52(); break;
+        default: console_exeb_mixed(); break;
+    }
+}
+
 inline void console_chkb() {
     if (coni >= 2 && conb[0] == 0x1b) {
         unsigned el = console_el();
@@ -365,9 +443,17 @@ inline void console_pushc(const uint8_t c) {
 }
 
 inline void console_putc(const uint8_t c) {
+    if (console_term == CONSOLE_ANSI) {
+        conctrl_putc(c);
+        return;
+    }
     const uint8_t a = c & 127; // remove parity?
     if (a == 0x1b || coni > 0) {
         console_pushc(a);
+    }
+    else if (console_term == CONSOLE_VT52) {
+        // Control codes as they are (CR, LF, BS, TAB, BEL...)
+        conctrl_putc(a);
     }
     else {
 //         Cursor left (bs) .............  08h     08
