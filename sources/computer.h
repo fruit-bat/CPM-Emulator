@@ -141,15 +141,17 @@ public:
 		std::cout << std::endl;
 
 		cpu.context = this;
-		cpu.fetch_opcode = cpu.fetch = cpu.nop = cpu.read = reinterpret_cast<Z80Read>(Computer::read);
+		cpu.fetch = cpu.nop = cpu.read = reinterpret_cast<Z80Read>(Computer::read);
+		// Stops the Z80 at the BDOS, BIOS, warm boot and HALT (see run())
+		cpu.fetch_opcode = reinterpret_cast<Z80Read>(Computer::fetchOpcode);
 		cpu.write = reinterpret_cast<Z80Write>(Computer::write);
 		cpu.in = Computer::in;
 		cpu.out = Computer::out;
 		cpu.nmia = NULL;
 		cpu.inta = NULL;
 		cpu.int_fetch = NULL;
-		cpu.halt = NULL;
-		cpu.hook = NULL;
+		cpu.hook = reinterpret_cast<Z80Read>(Computer::hook);
+		cpu.halt = reinterpret_cast<Z80Halt>(Computer::halted);
 		cpu.illegal = NULL;
 		cpu.options = Z80_MODEL_ZILOG_NMOS;
 		z80_power(&cpu, true);
@@ -218,13 +220,15 @@ public:
  * Run from the current PC until the end: a warm boot when running a lone program.
  */
 	/**
-	 * A monitor, called before each step of the Z80: an instruction, or a call
-	 * to the BDOS or BIOS (which the emulator carries out itself, taking no
-	 * clock cycles). It can look at and change the Z80 and the memory, and
-	 * take its time, e.g. to slow the Z80 down, or to step it. cycles is the
-	 * clock cycles the Z80 has run since start().
+	 * A monitor, called before each run of the Z80 and each call to the BDOS
+	 * or BIOS (which the emulator carries out itself, taking no clock cycles).
+	 * It can look at and change the Z80 and the memory, and take its time,
+	 * e.g. to slow the Z80 down. cycles is the clock cycles the Z80 has run
+	 * since start(). It returns how many cycles the Z80 may run before it is
+	 * called again (it may run a few more, to finish an instruction), or 0 for
+	 * one instruction, e.g. to step it.
 	 */
-	using Monitor = void (*)(void* ctx, Z80& cpu, uint8_t* memory, uint64_t cycles);
+	using Monitor = uint32_t (*)(void* ctx, Z80& cpu, uint8_t* memory, uint64_t cycles);
 
 	/**
 	 * Set the monitor, or NULL for none (the default).
@@ -236,9 +240,19 @@ public:
 
 	static constexpr uint32_t MEMORY_BYTES = MEMORY_SIZE * 1024U;
 
+	/**
+	 * The cycles the Z80 runs at a time without a monitor
+	 */
+	static constexpr uint32_t RUN_CYCLES = 10000;
+
+	/**
+	 * Runs the Z80 until it is at the BDOS, the BIOS or a warm boot, which
+	 * it carries out, then on. The Z80 runs many instructions at a time,
+	 * stopping at those addresses (and HALT) by fetchOpcode() and hook().
+	 */
 	void run() {
 		while (true) {
-			if (_monitor) _monitor(_monitor_ctx, cpu, memory, _cycles);
+			uint32_t budget = _monitor ? _monitor(_monitor_ctx, cpu, memory, _cycles) : RUN_CYCLES;
 			const uint16_t pc = Z80_PC(cpu);
 
 			if (pc == 0x0000 || pc == Bios::BOOT_ADDR || pc == Bios::WBOOT_ADDR) {	// Reset / warm boot
@@ -279,7 +293,15 @@ public:
 						  << pc << "!" << std::endl;
 				throw std::runtime_error(HALT_INSTRUCTION);
 			}
-			_cycles += z80_run(&cpu, 1);
+#ifdef LOG
+			budget = 0;	// An instruction at a time, to log each
+#endif
+			_cycles += z80_run(&cpu, budget ? budget : 1);
+			if (cpu.resume == Z80_RESUME_HALT) {	// A HALT run, PC past it
+				Z80_PC(cpu)--;
+				cpu.resume = 0;
+				continue;	// To report it, as above
+			}
 		}
 	}
 
@@ -374,6 +396,43 @@ protected:
  * @param address Memory address to be read.
  * @return read value. 
  */	
+	/**
+	 * Whether run() carries out what is at an address itself, so the Z80 must
+	 * stop there: the BDOS, the BIOS or a warm boot. (Not HALT, as opcodes
+	 * after a prefix are fetched too, e.g. CB 76, BIT 6,(HL): see halted().)
+	 */
+	bool isTrap(const zuint16 address) const {
+		return address >= BIOS_ADDR || address == 0x0000 || address == 0x0005
+			|| address == BDOS_ADDR + 6;
+	}
+
+	/**
+	 * A HALT: stops the Z80, for run() to report it
+	 */
+	static void halted(Computer* computer, zuint8 signal) {
+		if (signal) z80_break(&computer->cpu);
+	}
+
+	/**
+	 * Fetches an opcode, or at a trap (isTrap()) the Z80's trap opcode
+	 * (Z80_HOOK), which calls hook() to stop the Z80 there, PC unchanged
+	 */
+	static zuint8 fetchOpcode(Computer* computer, zuint16 address) {
+		return computer->isTrap(address) ? Z80_HOOK : computer->memory[address];
+	}
+
+	/**
+	 * The trap opcode fetched: at a trap, stops the Z80 for run(); else it
+	 * is a real `ld h,h`, which does nothing, as a NOP
+	 */
+	static zuint8 hook(Computer* computer, zuint16 address) {
+		if (computer->isTrap(address)) {
+			z80_break(&computer->cpu);
+			return Z80_HOOK;
+		}
+		return 0x00;
+	}
+
 	static zuint8 read(Computer* computer, zuint16 address) {
 		return computer->memory[address];
 	}
