@@ -159,6 +159,7 @@ public:
  * Initialize cpu, BIOS and BDOS (cold boot).
  */
 	void init() {
+		_cycles = 0;
 		z80_instant_reset(&cpu);
 		
 		bios.init(memory);
@@ -215,8 +216,28 @@ public:
 /**
  * Run from the current PC until the end: a warm boot when running a lone program.
  */
+	/**
+	 * A monitor, called before each step of the Z80: an instruction, or a call
+	 * to the BDOS or BIOS (which the emulator carries out itself, taking no
+	 * clock cycles). It can look at and change the Z80 and the memory, and
+	 * take its time, e.g. to slow the Z80 down, or to step it. cycles is the
+	 * clock cycles the Z80 has run since start().
+	 */
+	using Monitor = void (*)(void* ctx, Z80& cpu, uint8_t* memory, uint64_t cycles);
+
+	/**
+	 * Set the monitor, or NULL for none (the default).
+	 */
+	void setMonitor(Monitor monitor, void* ctx) {
+		_monitor = monitor;
+		_monitor_ctx = ctx;
+	}
+
+	static constexpr uint32_t MEMORY_BYTES = MEMORY_SIZE * 1024U;
+
 	void run() {
 		while (true) {
+			if (_monitor) _monitor(_monitor_ctx, cpu, memory, _cycles);
 			const uint16_t pc = Z80_PC(cpu);
 
 			if (pc == 0x0000 || pc == Bios::BOOT_ADDR || pc == Bios::WBOOT_ADDR) {	// Reset / warm boot
@@ -257,7 +278,7 @@ public:
 						  << pc << "!" << std::endl;
 				throw std::runtime_error(HALT_INSTRUCTION);
 			}
-			z80_run(&cpu, 1);	// return cycles
+			_cycles += z80_run(&cpu, 1);
 		}
 	}
 
@@ -1274,6 +1295,10 @@ protected:
 	}
 
 private:
+	Monitor _monitor = nullptr;
+	void* _monitor_ctx = nullptr;
+	uint64_t _cycles = 0;
+
 /**
  * Z80 processor 
  * Zilog Z80 CPU Emulator
