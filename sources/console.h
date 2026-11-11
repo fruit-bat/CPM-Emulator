@@ -27,7 +27,17 @@
  *   conctrl_kbhit()       non zero if a key is waiting (conctrl_status() may hide piped input)
  *   conctrl_getch()       a key if one is waiting, 0 otherwise
  *   conctrl_getch_wait()  wait for a key
- * This file turns the Kaypro / ADM-3A codes of CP/M programs into ANSI ones.
+ * and, if it defines CONCTRL_AUX, an auxiliary device (e.g. a serial port) for
+ * the reader (RDR:) and punch (PUN:):
+ *   conctrl_aux_in()      wait for a byte from it
+ *   conctrl_aux_out(c)    send it a byte
+ * This file turns the Kaypro / ADM-3A and CP/M-86 (VT52-like) codes of CP/M
+ * programs into ANSI ones. Where they differ, ESC B n and ESC C n are
+ * Kaypro's (set and clear an attribute, not VT52's cursor down and right),
+ * and ESC E (clear screen) and ESC Y r c (move the cursor) CP/M-86's (not
+ * Kaypro's insert line and clear to end of screen). Codes that are known but
+ * have no ANSI equivalent are dropped rather than passed on, as some of them
+ * do something else entirely on an ANSI terminal (e.g. ESC c resets xterm).
  */
 #include "host_console.h"
 
@@ -98,8 +108,8 @@ inline void conctrl_clear_to_end_of_screen() {
 //     https://mdfs.net/Archive/info-cpm/1985/01/19/053100.htm
 //     https://www.cse.psu.edu/~kxc104/class/cmpen472/16f/hw/hw8/vt100ansi.htm#:~:text=Cursor%20Home%20%5B%7B,upper%20left%20of%20the%20screen.
 //
-// Buffer console output so we can execute control sequences
-// TODO need a way to reset these
+// Buffer console output so we can execute control sequences. console_reset()
+// drops a part sent sequence, e.g. when a program ends.
 inline uint8_t conb[4];
 inline unsigned coni = 0;
 
@@ -115,8 +125,8 @@ inline unsigned console_el() {
         case 'f':
         case 'g':
         case 'h':
-        case 'l':
         case '=':
+        case '/':
             return 4;
         case 'a': 
         case 'b':
@@ -155,6 +165,7 @@ inline void console_exeb() {
             case '2': conctrl_esc(set ? "[5m" : "[25m"); break;     // blinking
             case '3': conctrl_esc(set ? "[4m" : "[24m"); break;     // underline
             case '4': conctrl_esc(set ? "[?25h" : "[?25l"); break;  // cursor on/off
+            case '6': conctrl_esc(set ? "7" : "8"); break;          // save/restore the cursor
             default: break;
         }
         break;
@@ -193,6 +204,35 @@ inline void console_exeb() {
     }
     case 'N': { // ESC N - delete character at cursor position
         conctrl_esc("[P");
+        break;
+    }
+    case 'R': { // ESC R - Kaypro: delete the current line
+        conctrl_esc("[M");
+        break;
+    }
+    case 'T': { // ESC T - Kaypro: clear to end of line
+        conctrl_clear_to_end_of_line();
+        break;
+    }
+    case '0':   // ESC 0, ESC 1 - status line off, on: there is none
+    case '1':
+    case 'a':   // ESC a m - screen mode
+    case 'd':   // ESC d/e/f/g/h h l - redirections
+    case 'e':
+    case 'f':
+    case 'g':
+    case 'h':
+    case '/': { // ESC / bh bl - BIOS video calls
+        break;
+    }
+    case 'b':   // ESC b c - foreground colour c
+    case 'c': { // ESC c c - background colour c
+        // IBM's colour order (blue first) to ANSI's (red first), bright from 8
+        static const uint8_t ansi[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
+        const unsigned c = conb[2] & 15;
+        char s[8];
+        snprintf(s, sizeof(s), "[%um", (conb[1] == 'b' ? (c & 8 ? 90 : 30) : (c & 8 ? 100 : 40)) + ansi[c & 7]);
+        conctrl_esc(s);
         break;
     }
     case 'Y': case '=': { // ESC Y r c - Move cursor to row r-32, column c-32
@@ -234,14 +274,22 @@ inline void console_exeb() {
         conctrl_restore_cursor_pos();
         break;
     }
-// ESC l
-// Erase all characters on the current line
-// ESC m
-// Enable cursor
-// ESC n
-// Disable cursor
-// ESC o
-// Erase characters up to the cursor position
+    case 'l': { // ESC l - Erase all characters on the current line
+        conctrl_esc("[2K");
+        break;
+    }
+    case 'm': { // ESC m - Enable cursor
+        conctrl_esc("[?25h");
+        break;
+    }
+    case 'n': { // ESC n - Disable cursor
+        conctrl_esc("[?25l");
+        break;
+    }
+    case 'o': { // ESC o - Erase characters up to the cursor position
+        conctrl_esc("[1K");
+        break;
+    }
 
 
     case 'p': { // ESC p - Select black text on white background
@@ -252,18 +300,30 @@ inline void console_exeb() {
         conctrl_white_text_on_black();
         break;
     }
-// ESC r
-// Select bright text
-// ESC s
-// Select flashing text
-// ESC t
-// Cancel flashing text
-// ESC u
-// Cancel bright text
-// ESC v
-// Allow wrapping at end of line
-// ESC w
-// Do not wrap at end of line
+    case 'r': { // ESC r - Select bright text
+        conctrl_esc("[1m");
+        break;
+    }
+    case 's': { // ESC s - Select flashing text
+        conctrl_esc("[5m");
+        break;
+    }
+    case 't': { // ESC t - Cancel flashing text
+        conctrl_esc("[25m");
+        break;
+    }
+    case 'u': { // ESC u - Cancel bright text
+        conctrl_esc("[22m");
+        break;
+    }
+    case 'v': { // ESC v - Allow wrapping at end of line
+        conctrl_esc("[?7h");
+        break;
+    }
+    case 'w': { // ESC w - Do not wrap at end of line
+        conctrl_esc("[?7l");
+        break;
+    }
     case 'x': { // ESC x - Mode MONO
         conctrl_mono_mode();
         break;

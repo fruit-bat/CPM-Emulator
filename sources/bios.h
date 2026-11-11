@@ -90,7 +90,19 @@ public:
 				console_putc(Z80_C(cpu));
 				break;
 			}
-			case LIST_ADDR :		// No printer: discard
+			case LIST_ADDR : {		// No printer: discard
+				break;
+			}
+#ifdef CONCTRL_AUX
+			case PUNCH_ADDR : {		// The host's auxiliary device (e.g. a serial port)
+				conctrl_aux_out(Z80_C(cpu));
+				break;
+			}
+			case READER_ADDR : {
+				Z80_A(cpu) = conctrl_aux_in();
+				break;
+			}
+#else
 			case PUNCH_ADDR : {		// No punch: discard
 				break;
 			}
@@ -98,6 +110,7 @@ public:
 				Z80_A(cpu) = 0x1A;
 				break;
 			}
+#endif
 			case HOME_ADDR :
 			case SETTRK_ADDR :
 			case SETSEC_ADDR :

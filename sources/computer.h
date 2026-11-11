@@ -160,6 +160,7 @@ public:
  */
 	void init() {
 		_cycles = 0;
+		console_reset();
 		z80_instant_reset(&cpu);
 		
 		bios.init(memory);
@@ -317,6 +318,7 @@ protected:
  * user are kept).
  */
 	void warmBoot() {
+		console_reset();	// Drop a part sent escape sequence
 		bios.init(memory);
 		bdos.reset(memory);
 		loadCCP();
