@@ -229,10 +229,15 @@ protected:
  * Supported by: All CP/M versions except MP/M and Concurrent CP/M
  * Entered with C=3. Returns A=L=ASCII character
  * Note that this call can hang if the auxiliary input never sends data.
- * No reader is emulated: always returns ^Z (end of file).
+ * The host's auxiliary device if it has one (CONCTRL_AUX), else none: always
+ * returns ^Z (end of file).
  */
 	void readerInput(Z80& cpu) {
+#ifdef CONCTRL_AUX
+		returnCode(cpu, conctrl_aux_in());
+#else
 		returnCode(cpu, 0x1A);
+#endif
 	}
 
 /**
@@ -240,9 +245,13 @@ protected:
  * Supported by: All versions except MP/M and Concurrent CP/M.
  * Entered with C=4, E=ASCII character.
  * If the device is permanently not ready, this call can hang.
- * No punch is emulated: the character is discarded.
+ * The host's auxiliary device if it has one (CONCTRL_AUX), else none: the
+ * character is discarded.
  */
 	void punchOutput(Z80& cpu) {
+#ifdef CONCTRL_AUX
+		conctrl_aux_out(Z80_E(cpu));
+#endif
 		returnCode(cpu, 0);
 	}
 
